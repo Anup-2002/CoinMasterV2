@@ -122,6 +122,30 @@ async function saveDebugScreenshot(page: any, name: string) {
   // Debug screenshots disabled for maximum execution speed as requested.
 }
 
+// Robust click helper to prevent timeouts on elements blocked by overlays or slow actionability checks
+async function clickResiliently(page: any, element: any, selectorDescription: string) {
+  try {
+    // Try to scroll the element into view first so actionability is easier to pass
+    await element.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+    
+    // Attempt normal click with a shorter timeout of 5 seconds so it doesn't hang for 30s
+    await element.click({ timeout: 5000 });
+  } catch (err) {
+    addLog("warning", `Standard click failed on ${selectorDescription}: ${(err as Error).message}. Trying forced click fallback...`);
+    try {
+      // Attempt click with force: true
+      await element.click({ force: true, timeout: 3000 });
+    } catch (err2) {
+      addLog("warning", `Forced click failed on ${selectorDescription}: ${(err2 as Error).message}. Using dispatchEvent click fallback...`);
+      // Fallback to dispatchEvent click (bypasses all visibility and actionability checks)
+      await element.dispatchEvent("click").catch((err3) => {
+        addLog("error", `All click attempts failed on ${selectorDescription}: ${(err3 as Error).message}`);
+        throw err3;
+      });
+    }
+  }
+}
+
 async function checkLoginReal(): Promise<{ status: "success" | "expired" | "captcha" | "failed"; message: string }> {
   addLog("info", "Playwright launching headlessly with stealth configurations...");
   const browser = await chromium.launch({
@@ -322,7 +346,7 @@ async function runRealPosting(url: string, message: string): Promise<{ status: "
     
     // Focus, write message naturally
     addLog("info", `Editor field focused. Typing comment: "${message}"`);
-    await editor.click();
+    await clickResiliently(page, editor, "comment editor input box");
     await page.waitForTimeout(300);
     
     // Clear existing text just in case, then type
@@ -349,7 +373,7 @@ async function runRealPosting(url: string, message: string): Promise<{ status: "
     }
     if (bullishBtn) {
       addLog("info", "Clicking bullish sentiment toggle...");
-      await bullishBtn.click();
+      await clickResiliently(page, bullishBtn, "bullish sentiment toggle button");
       await page.waitForTimeout(300);
     }
     
@@ -385,7 +409,7 @@ async function runRealPosting(url: string, message: string): Promise<{ status: "
     }
     
     addLog("info", "Clicking post submission button...");
-    await postBtn.click();
+    await clickResiliently(page, postBtn, "post submission button");
     
     // Wait for submission to process
     await page.waitForTimeout(3000);
@@ -549,8 +573,8 @@ app.post("/api/check-login", async (req, res) => {
   }
 });
 
-// 6. Fetch Trending Coins
-app.post("/api/fetch-trending", async (req, res) => {
+// 6. Fetch Trending Coins Logic and Router
+async function executeFetchTrending(): Promise<Coin[]> {
   addLog("info", "Starting cryptocurrency listings fetch...");
   botStatus = "Fetching";
 
@@ -619,7 +643,7 @@ app.post("/api/fetch-trending", async (req, res) => {
         const mockCoinsRaw = [
           { name: "Bitcoin", symbol: "BTC", price: 96420, change_24h: 3.42, cap: 1890000000000, vol: 45000000000, slug: "bitcoin" },
           { name: "Ethereum", symbol: "ETH", price: 3450, change_24h: -1.24, cap: 415000000000, vol: 18000000000, slug: "ethereum" },
-          { name: "Solana", symbol: "SOL", price: 186.4, change_24h: 8.76, cap: 87000000000, vol: 4500000000, slug: "solana" },
+          { name: "Solana", symbol: "SOL", price: 186.4, change_24h: 8.76, cap: 87000000000, vol: 450000000, slug: "solana" },
           { name: "Binance Coin", symbol: "BNB", price: 615.2, change_24h: 0.85, cap: 90000000000, vol: 1200000000, slug: "bnb" },
           { name: "Ripple", symbol: "XRP", price: 1.14, change_24h: 12.15, cap: 65000000000, vol: 3200000000, slug: "xrp" },
           { name: "Dogecoin", symbol: "DOGE", price: 0.385, change_24h: -4.12, cap: 56000000000, vol: 2800000000, slug: "dogecoin" },
@@ -654,16 +678,25 @@ app.post("/api/fetch-trending", async (req, res) => {
     writeJsonFile(LAST_TRENDING_FILE, coins);
     addLog("success", `Successfully fetched ${coins.length} coins. (Credits consumed: ${creditCount})`);
     botStatus = "Idle";
-    res.json({ status: "success", coins, credit_count: creditCount });
+    return coins;
   } catch (error) {
     addLog("error", `Failed fetching coins: ${(error as Error).message}`);
     botStatus = "Idle";
+    throw error;
+  }
+}
+
+app.post("/api/fetch-trending", async (req, res) => {
+  try {
+    const coins = await executeFetchTrending();
+    res.json({ status: "success", coins });
+  } catch (error) {
     res.status(500).json({ status: "error", message: (error as Error).message });
   }
 });
 
-// 7. Generate community messages
-app.post("/api/generate-messages", async (req, res) => {
+// 7. Generate community messages Logic and Router
+async function executeGenerateMessages(): Promise<GeneratedMessage[]> {
   addLog("info", "Starting community comments generation...");
   botStatus = "Generating";
 
@@ -671,7 +704,7 @@ app.post("/api/generate-messages", async (req, res) => {
   if (coins.length === 0) {
     addLog("error", "No trending coins found in output/last_trending.json. Please fetch trending coins first.");
     botStatus = "Idle";
-    return res.status(400).json({ error: "Trending coins list is empty." });
+    throw new Error("Trending coins list is empty.");
   }
 
   const generatedMessages: GeneratedMessage[] = [];
@@ -809,93 +842,106 @@ app.post("/api/generate-messages", async (req, res) => {
                       properties: {
                         symbol: { type: Type.STRING },
                         message: { type: Type.STRING }
-                      },
-                      required: ["symbol", "message"]
-                    }
+                    },
+                    required: ["symbol", "message"]
                   }
-                },
-                required: ["messages"]
-              }
+                }
+              },
+              required: ["messages"]
+            }
+          }
+        });
+
+        const rawText = response.text || "{}";
+        const parsed = JSON.parse(rawText.trim());
+        if (parsed.messages && Array.isArray(parsed.messages)) {
+          parsed.messages.forEach((msg: any) => {
+            const matchCoin = chunk.find(c => c.symbol.toLowerCase() === msg.symbol?.toLowerCase());
+            if (matchCoin) {
+              generatedMessages.push({
+                name: matchCoin.name,
+                symbol: matchCoin.symbol,
+                url: matchCoin.url,
+                message: msg.message,
+              });
             }
           });
-
-          const rawText = response.text || "{}";
-          const parsed = JSON.parse(rawText.trim());
-          if (parsed.messages && Array.isArray(parsed.messages)) {
-            parsed.messages.forEach((msg: any) => {
-              const matchCoin = chunk.find(c => c.symbol.toLowerCase() === msg.symbol?.toLowerCase());
-              if (matchCoin) {
-                generatedMessages.push({
-                  name: matchCoin.name,
-                  symbol: matchCoin.symbol,
-                  url: matchCoin.url,
-                  message: msg.message,
-                });
-              }
-            });
-          }
         }
-      } catch (geminiError) {
-        addLog("error", `Gemini API Call failed: ${(geminiError as Error).message}.`);
-        geminiFailed = true;
       }
+    } catch (geminiError) {
+      addLog("error", `Gemini API Call failed: ${(geminiError as Error).message}.`);
+      geminiFailed = true;
     }
+  }
 
-    if (generatedMessages.length === 0) {
-      addLog("warning", "AI generation was not completed or failed. Falling back to robust rule-based template generation...");
-      
-      // Dynamic high-quality rule-based generator mimicking an active community
-      const templates = {
-        bullish: [
-          (c: Coin) => `${c.symbol} is looking extremely strong right now. Holding support beautifully and volume is accelerating. Next target looks very interesting!`,
-          (c: Coin) => `A strong 24h gain of ${c.change_24h}% for ${c.symbol}. The consolidation phase seems finished, expecting higher levels very soon.`,
-          (c: Coin) => `Volume on ${c.symbol} is absolutely popping. If we break this local resistance, we could easily see another leg up.`,
-          (c: Coin) => `Loving the price action on ${c.symbol} lately. Steady accumulation going on in this range.`,
-        ],
-        bearish: [
-          (c: Coin) => `${c.symbol} has some short-term pressure. Volume is declining, let's see if the key support holds.`,
-          (c: Coin) => `Slight pullback for ${c.symbol} at ${c.price}. Good opportunity to DCA before the next bounce.`,
-          (c: Coin) => `A ${c.change_24h}% pullback on ${c.symbol}. Watching the 4h charts closely for a reversal sign.`,
-          (c: Coin) => `Momentum is flat for ${c.symbol} today. Waiting for a breakout trigger before entering more positions.`,
-        ]
-      };
-
-      coins.forEach((coin, index) => {
-        const list = coin.change_24h >= 0 ? templates.bullish : templates.bearish;
-        const fn = list[index % list.length];
-        generatedMessages.push({
-          name: coin.name,
-          symbol: coin.symbol,
-          url: coin.url,
-          message: fn(coin),
-        });
-      });
-    }
-
-    writeJsonFile(GENERATED_MESSAGES_FILE, generatedMessages);
-    // Write fresh progress file
-    writeJsonFile(POST_PROGRESS_FILE, { next_index: 0 });
+  if (generatedMessages.length === 0) {
+    addLog("warning", "AI generation was not completed or failed. Falling back to robust rule-based template generation...");
     
-    addLog("success", `Successfully generated community comments for all ${generatedMessages.length} coins! Saved to generated_messages.json.`);
-    botStatus = "Idle";
+    // Dynamic high-quality rule-based generator mimicking an active community
+    const templates = {
+      bullish: [
+        (c: Coin) => `${c.symbol} is looking extremely strong right now. Holding support beautifully and volume is accelerating. Next target looks very interesting!`,
+        (c: Coin) => `A strong 24h gain of ${c.change_24h}% for ${c.symbol}. The consolidation phase seems finished, expecting higher levels very soon.`,
+        (c: Coin) => `Volume on ${c.symbol} is absolutely popping. If we break this local resistance, we could easily see another leg up.`,
+        (c: Coin) => `Loving the price action on ${c.symbol} lately. Steady accumulation going on in this range.`,
+      ],
+      bearish: [
+        (c: Coin) => `${c.symbol} has some short-term pressure. Volume is declining, let's see if the key support holds.`,
+        (c: Coin) => `Slight pullback for ${c.symbol} at ${c.price}. Good opportunity to DCA before the next bounce.`,
+        (c: Coin) => `A ${c.change_24h}% pullback on ${c.symbol}. Watching the 4h charts closely for a reversal sign.`,
+        (c: Coin) => `Momentum is flat for ${c.symbol} today. Waiting for a breakout trigger before entering more positions.`,
+      ]
+    };
+
+    coins.forEach((coin, index) => {
+      const list = coin.change_24h >= 0 ? templates.bullish : templates.bearish;
+      const fn = list[index % list.length];
+      generatedMessages.push({
+        name: coin.name,
+        symbol: coin.symbol,
+        url: coin.url,
+        message: fn(coin),
+      });
+    });
+  }
+
+  writeJsonFile(GENERATED_MESSAGES_FILE, generatedMessages);
+  // Write fresh progress file
+  writeJsonFile(POST_PROGRESS_FILE, { next_index: 0 });
+  
+  addLog("success", `Successfully generated community comments for all ${generatedMessages.length} coins! Saved to generated_messages.json.`);
+  botStatus = "Idle";
+  return generatedMessages;
+} catch (error) {
+  addLog("error", `Failed message generation: ${(error as Error).message}`);
+  botStatus = "Idle";
+  throw error;
+}
+}
+
+app.post("/api/generate-messages", async (req, res) => {
+  try {
+    const generatedMessages = await executeGenerateMessages();
     res.json({ status: "success", count: generatedMessages.length });
   } catch (error) {
-    addLog("error", `Failed message generation: ${(error as Error).message}`);
-    botStatus = "Idle";
     res.status(500).json({ status: "error", message: (error as Error).message });
   }
 });
 
-// 8. Start posting sequence (Loop)
-app.post("/api/post-chat", (req, res) => {
+// 8. Start posting sequence Logic and Router
+function executePostChat(): { status: string; message: string; startIndex: number } {
   if (isPostingRunning) {
-    return res.json({ status: "success", message: "Bot posting sequence is already active." });
+    return {
+      status: "success",
+      message: "Bot posting sequence is already active.",
+      startIndex: currentPostingIndex,
+    };
   }
 
   const messages = readJsonFile<GeneratedMessage[]>(GENERATED_MESSAGES_FILE, []);
   if (messages.length === 0) {
     addLog("error", "No generated comments found in generated_messages.json. Please generate comments first.");
-    return res.status(400).json({ error: "Comments list is empty." });
+    throw new Error("Comments list is empty.");
   }
 
   isPostingRunning = true;
@@ -909,11 +955,20 @@ app.post("/api/post-chat", (req, res) => {
   // Start asynchronous runner
   runPostingLoop();
 
-  res.json({
+  return {
     status: "success",
     message: "Posting sequence started successfully.",
     startIndex: currentPostingIndex,
-  });
+  };
+}
+
+app.post("/api/post-chat", (req, res) => {
+  try {
+    const result = executePostChat();
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message });
+  }
 });
 
 // Asynchronous Posting Loop
@@ -1110,23 +1165,20 @@ app.post("/api/full-flow", async (req, res) => {
 
     // Step 1: Fetch
     addLog("info", "[FLOW STEP 1/3] Fetching latest trending coins...");
-    // Direct call inside Express logic
-    const fetchRes = await fetch(`http://localhost:${PORT}/api/fetch-trending`, { method: "POST" });
-    if (!fetchRes.ok) throw new Error("Step 1 Fetch failed.");
+    await executeFetchTrending();
 
     // Step 2: Generate
     addLog("info", "[FLOW STEP 2/3] Generating custom AI community comments...");
-    const genRes = await fetch(`http://localhost:${PORT}/api/generate-messages`, { method: "POST" });
-    if (!genRes.ok) throw new Error("Step 2 Generate failed.");
+    await executeGenerateMessages();
 
     // Step 3: Post
     addLog("info", "[FLOW STEP 3/3] Launching automated comment submitter...");
-    const postRes = await fetch(`http://localhost:${PORT}/api/post-chat`, { method: "POST" });
-    if (!postRes.ok) throw new Error("Step 3 Posting failed.");
+    const result = executePostChat();
 
     res.json({
       success: true,
       message: "End-to-End sequence started successfully. Monitoring logs...",
+      startIndex: result.startIndex,
     });
   } catch (error) {
     addLog("error", `Full Flow failed: ${(error as Error).message}`);

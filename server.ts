@@ -103,7 +103,7 @@ interface PostResult {
   name: string;
   symbol: string;
   url: string;
-  status: "success" | "captcha" | "expired" | "failed" | "retry";
+  status: "success" | "captcha" | "expired" | "failed" | "retry" | "rate_limited";
   message: string;
   timestamp: string;
 }
@@ -147,6 +147,36 @@ async function clickResiliently(page: any, element: any, selectorDescription: st
         throw err3;
       }
     }
+  }
+}
+
+async function detectCaptcha(page: any): Promise<boolean> {
+  try {
+    const title = await page.title().catch(() => "");
+    if (title.toLowerCase().includes("cloudflare") || title.toLowerCase().includes("just a moment")) {
+      return true;
+    }
+    
+    const hasCfSelectors = await page.locator('#challenge-running, #challenge-stage, .cf-turnstile, iframe[src*="challenge"], iframe[src*="turnstile"]').count().catch(() => 0);
+    if (hasCfSelectors > 0) {
+      return true;
+    }
+    
+    const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+    const explicitPhrases = [
+      "verify you are human",
+      "verify you are a human",
+      "checking your browser before accessing",
+      "checking your browser...",
+      "are you a robot",
+      "captcha challenge",
+      "solve the captcha",
+      "security challenge to proceed",
+    ];
+    
+    return explicitPhrases.some(phrase => pageText.includes(phrase));
+  } catch (err) {
+    return false;
   }
 }
 
@@ -244,12 +274,7 @@ async function checkLoginReal(): Promise<{ status: "success" | "expired" | "capt
     if (!editor) {
       await saveDebugScreenshot(page, "editor_not_found");
       
-      // Let's check for specific Cloudflare captcha elements first
-      const title = await page.title().catch(() => "");
-      const hasCfTitle = title.includes("Cloudflare") || title.includes("Just a moment");
-      const hasCfSelectors = await page.$('#challenge-running, #challenge-stage, .cf-turnstile').catch(() => null);
-      
-      if (hasCfTitle || hasCfSelectors) {
+      if (await detectCaptcha(page)) {
         addLog("error", "CRITICAL: Cloudflare Turnstile human challenge detected on page!");
         return { status: "captcha", message: "Cloudflare Turnstile captcha block" };
       }
@@ -299,14 +324,17 @@ async function runRealPostingWithPage(page: any, url: string, message: string): 
   try {
     addLog("info", `Navigating to target coin URL: ${url}`);
     
-    await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 40000
-    });
+    try {
+      await page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: 20000
+      });
+    } catch (gotoErr: any) {
+      addLog("warning", `Page navigation reached timeout or threw an error, but proceeding to see if page loaded anyway: ${gotoErr.message}`);
+    }
     
-    // Wait for the page to settle down (random delay like random_page_wait in Python)
-    const pageWaitTime = Math.floor(1200 + Math.random() * 1000);
-    await page.waitForTimeout(pageWaitTime);
+    // Quick settle down wait
+    await page.waitForTimeout(400);
 
     // Redirect or logout check
     const currentUrl = page.url().toLowerCase();
@@ -315,66 +343,58 @@ async function runRealPostingWithPage(page: any, url: string, message: string): 
       return { status: "expired", message: "Redirected to login" };
     }
 
-    // Captcha Detection on page text (just like the Python script does)
-    const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
-    const captchaKeywords = [
-      "captcha",
-      "verify you are human",
-      "security check",
-      "cloudflare",
-      "challenge",
-      "checking your browser",
-      "attention required",
-      "please verify",
-      "are you a robot"
-    ];
-    for (const word of captchaKeywords) {
-      if (pageText.includes(word)) {
-        addLog("error", `Captcha keyword detected: "${word}"`);
-        return { status: "captcha", message: "Captcha detected" };
-      }
+    // Captcha Detection
+    if (await detectCaptcha(page)) {
+      addLog("error", "CRITICAL: Captcha challenge detected on page!");
+      return { status: "captcha", message: "Captcha detected" };
     }
 
-    // Editor Locators
-    let editor = null;
-    const editorSelectors = [
+    // Combined Selector for Editor to find instantly in one Playwright call
+    const editorSelector = [
       '[data-test="base-editor-editable"]',
       'div[contenteditable="true"]',
       '.public-DraftEditor-content',
       'textarea[placeholder*="thoughts"]',
       'textarea[placeholder*="comment"]',
       '[placeholder*="thoughts"]'
-    ];
+    ].join(', ');
+
+    let editor = page.locator(editorSelector).first();
+    let isEditorVisible = false;
 
     addLog("info", "Scanning page for comment editor...");
-    for (const selector of editorSelectors) {
-      try {
-        const el = page.locator(selector);
-        await el.waitFor({ state: "visible", timeout: 1500 });
-        editor = el;
-        addLog("info", `Located comment editor immediately using locator: ${selector}`);
-        break;
-      } catch (err) {}
-    }
+    try {
+      await editor.waitFor({ state: "visible", timeout: 2000 });
+      isEditorVisible = true;
+      addLog("info", "Located comment editor immediately!");
+    } catch (err) {}
 
-    if (!editor) {
-      addLog("info", "Comment editor not visible immediately. Performing mouse wheel scroll like in Python...");
-      const scrollY = Math.floor(200 + Math.random() * 400); // 200px to 600px scroll
-      await page.mouse.wheel(0, scrollY);
-      await page.waitForTimeout(300 + Math.floor(Math.random() * 400)); // 300 to 700 ms pause
-
-      for (const selector of editorSelectors) {
+    if (!isEditorVisible) {
+      addLog("info", "Comment editor not visible immediately. Performing incremental scrolls to trigger lazy loading...");
+      // Scroll in increments of 500px up to 3 times (total 1500px)
+      for (let i = 1; i <= 3; i++) {
+        addLog("info", `Scroll step ${i}/3 down by 500px...`);
+        await page.mouse.wheel(0, 500);
+        await page.waitForTimeout(400);
         try {
-          const el = page.locator(selector);
-          await el.waitFor({ state: "visible", timeout: 3000 });
-          editor = el;
-          addLog("info", `Located comment editor after scrolling using: ${selector}`);
+          await editor.waitFor({ state: "visible", timeout: 1000 });
+          isEditorVisible = true;
+          addLog("info", `Located comment editor after scroll step ${i}.`);
           break;
         } catch (err) {}
       }
     }
 
-    if (!editor) {
+    // If still not visible, check if it's present in the DOM so we can still attempt to interact
+    if (!isEditorVisible) {
+      const count = await editor.count().catch(() => 0);
+      if (count > 0) {
+        isEditorVisible = true;
+        addLog("info", "Located editor in DOM. Attempting to use it despite visibility check.");
+      }
+    }
+
+    if (!isEditorVisible) {
       await saveDebugScreenshot(page, "posting_editor_not_found");
       
       const title = await page.title().catch(() => "");
@@ -397,23 +417,24 @@ async function runRealPostingWithPage(page: any, url: string, message: string): 
     }
 
     addLog("info", "Focusing and clicking comment editor...");
+    await editor.scrollIntoViewIfNeeded().catch(() => {});
     // Use force: true to bypass any covered actionability checks/overlays perfectly
     await editor.click({ force: true, timeout: 5000 }).catch(async (clickErr: any) => {
       addLog("warning", `Standard force click failed: ${clickErr.message}. Trying dispatchEvent fallback.`);
       await editor.evaluate((el: any) => el.click()).catch(() => {});
     });
 
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(300);
 
     addLog("info", "Clearing existing text and typing message...");
+    await editor.focus().catch(() => {});
     await page.keyboard.press("Control+A");
     await page.keyboard.press("Backspace");
-    await page.waitForTimeout(200);
+    await page.waitForTimeout(100);
 
-    // Calculate typing delay like Python script's random_typing_delay() (32 to 80 ms)
-    const typingDelay = Math.floor(32 + Math.random() * 48);
-    await page.keyboard.type(message, { delay: typingDelay });
-    await page.waitForTimeout(400);
+    // Instant typing using keyboard.insertText to be fast and fully compatible with React/DraftJS
+    await page.keyboard.insertText(message);
+    await page.waitForTimeout(300);
 
     // Bullish Sentiment Button Selection
     const bullishSelectors = [
@@ -423,23 +444,16 @@ async function runRealPostingWithPage(page: any, url: string, message: string): 
       '.bullish-button',
       '[class*="bullish" i]'
     ];
-    let bullishBtn = null;
-    for (const selector of bullishSelectors) {
-      const btn = page.locator(selector);
-      const count = await btn.count().catch(() => 0);
-      if (count > 0) {
-        bullishBtn = btn;
-        addLog("info", `Found bullish sentiment toggle using: ${selector}`);
-        break;
-      }
-    }
-    if (bullishBtn) {
+    const bullishSelector = bullishSelectors.join(', ');
+    const bullishBtn = page.locator(bullishSelector).first();
+    const bullishCount = await bullishBtn.count().catch(() => 0);
+    if (bullishCount > 0) {
       addLog("info", "Clicking bullish sentiment toggle...");
       await bullishBtn.click({ force: true, timeout: 3000 }).catch(async (err: any) => {
         addLog("warning", `Failed to click bullish toggle: ${err.message}. Trying evaluate click.`);
         await bullishBtn.evaluate((el: any) => el.click()).catch(() => {});
       });
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(200);
     }
 
     // Locate Submit/Post Button
@@ -452,18 +466,11 @@ async function runRealPostingWithPage(page: any, url: string, message: string): 
       'button.editor-post-button',
       '.editor-post-button'
     ];
-    let postBtn = null;
-    for (const selector of postButtonSelectors) {
-      const btn = page.locator(selector);
-      const count = await btn.count().catch(() => 0);
-      if (count > 0) {
-        postBtn = btn;
-        addLog("info", `Found submit button using: ${selector}`);
-        break;
-      }
-    }
+    const postButtonSelector = postButtonSelectors.join(', ');
+    const postBtn = page.locator(postButtonSelector).first();
+    const postBtnCount = await postBtn.count().catch(() => 0);
 
-    if (!postBtn) {
+    if (postBtnCount === 0) {
       addLog("error", "Post submission button is missing on page.");
       await saveDebugScreenshot(page, "post_button_missing");
       return { status: "failed", message: "Post submission button missing" };
@@ -477,11 +484,7 @@ async function runRealPostingWithPage(page: any, url: string, message: string): 
       return { status: "expired", message: "Post button text is Log In" };
     }
 
-    // Human-like mouse movement prior to submit (like page.mouse.move in Python)
-    const mouseX = Math.floor(300 + Math.random() * 600);
-    const mouseY = Math.floor(200 + Math.random() * 400);
-    await page.mouse.move(mouseX, mouseY).catch(() => {});
-    await page.waitForTimeout(200 + Math.floor(Math.random() * 500));
+    await page.waitForTimeout(200);
 
     addLog("info", "Clicking post submission button...");
     await postBtn.click({ force: true, timeout: 5000 }).catch(async (clickErr: any) => {
@@ -489,18 +492,15 @@ async function runRealPostingWithPage(page: any, url: string, message: string): 
       await postBtn.evaluate((el: any) => el.click()).catch(() => {});
     });
 
-    // Wait after submit (random_post_wait in Python script, 2000 to 3500 ms)
-    const postWait = Math.floor(2000 + Math.random() * 1500);
-    await page.waitForTimeout(postWait);
+    // Settle delay after submit
+    await page.waitForTimeout(2000);
 
     const bodyTextAfter = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
 
     // Captcha re-detection after click
-    for (const word of captchaKeywords) {
-      if (bodyTextAfter.includes(word)) {
-        addLog("error", `Captcha detected after clicking post button: "${word}"`);
-        return { status: "captcha", message: "Captcha detected on submission" };
-      }
+    if (await detectCaptcha(page)) {
+      addLog("error", "Captcha detected after clicking post button.");
+      return { status: "captcha", message: "Captcha detected on submission" };
     }
 
     // Login expired re-detection
@@ -512,12 +512,11 @@ async function runRealPostingWithPage(page: any, url: string, message: string): 
     // Rate limit re-detection
     const rateLimitKeywords = [
       "too many requests",
+      "posting too fast",
       "try again later",
-      "please wait",
+      "posting too frequently",
       "rate limit",
-      "frequent",
-      "too fast",
-      "seconds before"
+      "slow down"
     ];
     for (const word of rateLimitKeywords) {
       if (bodyTextAfter.includes(word)) {
@@ -572,16 +571,6 @@ async function runRealPosting(url: string, message: string): Promise<{ status: "
     });
 
     const page = await context.newPage();
-
-    // Optimize page loading speed and memory by 80%+ by blocking heavy images, media, and fonts safely
-    await page.route("**/*", (route: any, request: any) => {
-      const type = request.resourceType();
-      if (type === "image" || type === "media" || type === "font") {
-        route.abort();
-      } else {
-        route.continue();
-      }
-    }).catch(() => {});
 
     // Delegate directly to our unified resilient page posting function
     return await runRealPostingWithPage(page, url, message);
@@ -810,28 +799,17 @@ app.post("/api/login/initiate", async (req, res) => {
     // Wait for response/navigation
     await page.waitForTimeout(5000);
 
-    const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
-    
     // Check if Cloudflare / Captcha is shown
-    const captchaKeywords = [
-      "captcha",
-      "verify you are human",
-      "security check",
-      "cloudflare",
-      "challenge",
-      "checking your browser",
-      "are you a robot"
-    ];
-    for (const word of captchaKeywords) {
-      if (pageText.includes(word)) {
-        addLog("error", `Captcha detected during login: "${word}"`);
-        await browser.close().catch(() => {});
-        return res.json({
-          status: "captcha",
-          message: `Blocked by verification challenge: "${word}". Please solve it or upload state.json manually.`
-        });
-      }
+    if (await detectCaptcha(page)) {
+      addLog("error", "Captcha detected during login.");
+      await browser.close().catch(() => {});
+      return res.json({
+        status: "captcha",
+        message: "Blocked by verification challenge. Please solve it or upload state.json manually."
+      });
     }
+
+    const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
 
     // Check if OTP/Verification is requested
     const otpKeywords = [
@@ -1231,156 +1209,8 @@ async function executeFetchTrending(): Promise<Coin[]> {
     addLog("warning", `Stage 1: CoinMarketCap Public Data API failed: ${(err as Error).message}`);
   }
 
-  // STAGE 2: If Stage 1 failed, use Playwright to scrape real-time trending coins directly from CMC page
-  if (coins.length === 0) {
-    try {
-      addLog("info", "Stage 2: Launching Playwright browser session to scrape CoinMarketCap Trending Cryptocurrencies...");
-      const browser = await chromium.launch({
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-gpu",
-          "--disable-web-security"
-        ]
-      });
-
-      try {
-        const context = await browser.newContext({
-          userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-          viewport: { width: 1280, height: 800 }
-        });
-        const page = await context.newPage();
-        
-        addLog("info", "Navigating Playwright to https://coinmarketcap.com/trending-cryptocurrencies/");
-        await page.goto("https://coinmarketcap.com/trending-cryptocurrencies/", {
-          waitUntil: "domcontentloaded",
-          timeout: 25000
-        });
-
-        addLog("info", "Waiting for trending list rows to load...");
-        await page.waitForSelector("tbody tr a[href*='/currencies/']", { timeout: 15000 });
-        await page.waitForTimeout(2000); // Wait for all data to settle
-
-        const scraped: Coin[] = await page.evaluate(() => {
-          const results: any[] = [];
-          const rows = Array.from(document.querySelectorAll("tbody tr"));
-          rows.forEach((row, index) => {
-            try {
-              const linkEl = row.querySelector("a[href*='/currencies/']");
-              if (!linkEl) return;
-
-              const href = linkEl.getAttribute("href") || "";
-              const parts = href.split("/");
-              const slug = parts[parts.indexOf("currencies") + 1] || "";
-              if (!slug) return;
-
-              // Extract rank
-              const rankText = row.querySelector("td:nth-child(2)")?.textContent?.trim() || "";
-              const rank = parseInt(rankText) || (index + 1);
-
-              // Extract Name and Symbol
-              const nameEl = linkEl.querySelector(".base-text") || linkEl.querySelector("span:not(.sub-info)");
-              const symbolEl = row.querySelector(".sub-info, .coin-item-symbol, .crypto-symbol");
-              
-              let name = nameEl?.textContent?.trim() || "";
-              let symbol = symbolEl?.textContent?.trim() || "";
-              
-              // Fallback parsing from full link text if needed
-              if (!name || !symbol) {
-                const fullText = linkEl.textContent?.replace("Buy", "").trim() || "";
-                if (fullText) {
-                  const match = fullText.match(/^(.+?)([A-Z]{2,10})$/);
-                  if (match) {
-                    if (!name) name = match[1];
-                    if (!symbol) symbol = match[2];
-                  } else {
-                    if (!name) name = fullText;
-                    if (!symbol) symbol = slug.toUpperCase();
-                  }
-                }
-              }
-
-              // Price (4th column)
-              const priceTd = row.querySelector("td:nth-child(4)");
-              const priceText = priceTd?.textContent?.trim() || "";
-              const priceMatch = priceText.match(/\$?([0-9,.]+)/);
-              const price = priceMatch ? parseFloat(priceMatch[1].replace(/,/g, "")) : 0;
-
-              // 1h change (5th column)
-              const change1hTd = row.querySelector("td:nth-child(5)");
-              const change1hText = change1hTd?.textContent?.trim() || "";
-              const change1hMatch = change1hText.match(/([0-9.-]+)%/);
-              let change1h = change1hMatch ? parseFloat(change1hMatch[1]) : 0;
-              const is1hDown = change1hTd?.innerHTML.includes("caret-down") || change1hTd?.innerHTML.includes("down");
-              if (is1hDown && change1h > 0) change1h = -change1h;
-
-              // 24h change (6th column)
-              const change24hTd = row.querySelector("td:nth-child(6)");
-              const change24hText = change24hTd?.textContent?.trim() || "";
-              const change24hMatch = change24hText.match(/([0-9.-]+)%/);
-              let change24h = change24hMatch ? parseFloat(change24hMatch[1]) : 0;
-              const is24hDown = change24hTd?.innerHTML.includes("caret-down") || change24hTd?.innerHTML.includes("down");
-              if (is24hDown && change24h > 0) change24h = -change24h;
-
-              // Market Cap (7th column)
-              const capTd = row.querySelector("td:nth-child(7)");
-              const capText = capTd?.textContent?.trim() || "";
-              const capMatch = capText.match(/\$?([0-9,.]+)([KMBTr]?)/);
-              let market_cap = 0;
-              if (capMatch) {
-                market_cap = parseFloat(capMatch[1].replace(/,/g, ""));
-                const suffix = capMatch[2];
-                if (suffix === "T") market_cap *= 1000000000000;
-                else if (suffix === "B") market_cap *= 1000000000;
-                else if (suffix === "M") market_cap *= 1000000;
-              }
-
-              // Volume 24h (8th column)
-              const volTd = row.querySelector("td:nth-child(8)");
-              const volText = volTd?.textContent?.trim() || "";
-              const volMatch = volText.match(/\$?([0-9,.]+)([KMBTr]?)/);
-              let volume_24h = 0;
-              if (volMatch) {
-                volume_24h = parseFloat(volMatch[1].replace(/,/g, ""));
-                const suffix = volMatch[2];
-                if (suffix === "T") volume_24h *= 1000000000000;
-                else if (suffix === "B") volume_24h *= 1000000000;
-                else if (suffix === "M") volume_24h *= 1000000;
-              }
-
-              results.push({
-                name,
-                symbol: symbol.toUpperCase(),
-                price: price || 0,
-                change_1h: change1h || 0,
-                change_24h: change24h || 0,
-                change_7d: 0,
-                market_cap: market_cap || 0,
-                volume_24h: volume_24h || 0,
-                cmc_rank: rank,
-                slug,
-                url: "https://coinmarketcap.com/currencies/" + slug + "/"
-              });
-            } catch (err) {
-              // Ignore row error
-            }
-          });
-          return results;
-        });
-
-        if (scraped && scraped.length > 0) {
-          coins = scraped.slice(0, 50);
-          successSource = "CoinMarketCap Playwright Scraping (Trending)";
-        }
-      } finally {
-        await browser.close().catch(() => {});
-      }
-    } catch (err) {
-      addLog("warning", `Stage 2: CoinMarketCap Playwright scraping failed: ${(err as Error).message}`);
-    }
-  }
+  // STAGE 2: Playwright trending scraper was removed as an unnecessary, slow, and flaky fallback.
+  // We prioritize direct, lightning-fast public APIs, local cache, and high-fidelity simulated backups to ensure zero-delay runs.
 
   // STAGE 3: Use official Pro API if key is present
   if (coins.length === 0 && process.env.CMC_API_KEY) {
@@ -1535,7 +1365,8 @@ async function executeGenerateMessages(): Promise<GeneratedMessage[]> {
 
   try {
     let openAiFailed = false;
-    if (process.env.OPENAI_API_KEY) {
+    const isLocalOpenAiValid = process.env.OPENAI_API_KEY && !process.env.OPENAI_API_KEY.includes("*") && process.env.OPENAI_API_KEY.trim() !== "";
+    if (isLocalOpenAiValid) {
       try {
         const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
         addLog("info", "Initializing OpenAI SDK with gpt-4o-mini...");
@@ -1607,8 +1438,9 @@ async function executeGenerateMessages(): Promise<GeneratedMessage[]> {
 
     let geminiFailed = false;
     const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    const isLocalGeminiValid = geminiKey && !geminiKey.includes("*") && geminiKey.trim() !== "";
 
-    if ((!process.env.OPENAI_API_KEY || openAiFailed) && geminiKey) {
+    if ((!isLocalOpenAiValid || openAiFailed) && isLocalGeminiValid) {
       try {
         addLog("info", "Using Gemini API (gemini-3.5-flash) as the primary AI fallback...");
         const ai = new GoogleGenAI({
@@ -1839,16 +1671,6 @@ async function runPostingLoop() {
       });
       
       page = await context.newPage();
-
-      // Optimize page loading speed and memory by 80%+ by blocking heavy images, media, and fonts safely
-      await page.route("**/*", (route: any, request: any) => {
-        const type = request.resourceType();
-        if (type === "image" || type === "media" || type === "font") {
-          route.abort();
-        } else {
-          route.continue();
-        }
-      }).catch(() => {});
     } catch (err) {
       addLog("error", `Failed to initialize Playwright browser: ${(err as Error).message}`);
       isPostingRunning = false;
@@ -1932,57 +1754,19 @@ async function runPostingLoop() {
         currentPostingIndex++;
         writeJsonFile(POST_PROGRESS_FILE, { next_index: currentPostingIndex });
       } else if (outcome === "retry") {
-        addLog("info", "Executing scheduled retry attempt...");
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        consecutiveFailures++;
+        addLog("warning", `WARNING: Rate limit on submission for ${item.symbol} (${consecutiveFailures}/3 consecutive failures). Skipped to avoid blocking.`);
         
-        let retrySuccess = false;
-        if (runMode === "Real Browser" && page) {
-          try {
-            addLog("info", "Retrying post with active Playwright context page...");
-            const retryResult = await runRealPostingWithPage(page, item.url, item.message);
-            if (retryResult.status === "success") {
-              addLog("success", `SUCCESS: Retry posting succeeded for ${item.symbol}!`);
-              retrySuccess = true;
-              consecutiveFailures = 0;
-              results.push({
-                name: item.name,
-                symbol: item.symbol,
-                url: item.url,
-                status: "success",
-                message: "Posted successfully after retry",
-                timestamp: new Date().toLocaleTimeString(),
-              });
-            } else {
-              addLog("error", `FAIL: Retry posting failed: ${retryResult.message}`);
-              consecutiveFailures++;
-              results.push({
-                name: item.name,
-                symbol: item.symbol,
-                url: item.url,
-                status: retryResult.status,
-                message: retryResult.message,
-                timestamp: new Date().toLocaleTimeString(),
-              });
-            }
-          } catch (err) {
-            addLog("error", `Exception in retry: ${(err as Error).message}`);
-            consecutiveFailures++;
-          }
-        } else {
-          addLog("success", `SUCCESS: Retry posting succeeded for ${item.symbol}!`);
-          retrySuccess = true;
-          consecutiveFailures = 0;
-          results.push({
-            name: item.name,
-            symbol: item.symbol,
-            url: item.url,
-            status: "success",
-            message: "Posted successfully after retry",
-            timestamp: new Date().toLocaleTimeString(),
-          });
-        }
-        
+        results.push({
+          name: item.name,
+          symbol: item.symbol,
+          url: item.url,
+          status: "rate_limited",
+          message: "Skipped due to rate limit on submission",
+          timestamp: new Date().toLocaleTimeString(),
+        });
         writeJsonFile(RESULTS_FILE, results);
+        
         currentPostingIndex++;
         writeJsonFile(POST_PROGRESS_FILE, { next_index: currentPostingIndex });
       } else if (outcome === "captcha") {
@@ -2069,6 +1853,28 @@ app.post("/api/stop-posting", (req, res) => {
   botStatus = "Idle";
   addLog("warning", "Automated posting sequence has been manually stopped/paused.");
   res.json({ success: true, message: "Posting sequence stopped." });
+});
+
+// Endpoint to skip current coin when captcha or block is detected
+app.post("/api/skip-coin", (req, res) => {
+  const messages = readJsonFile<GeneratedMessage[]>(GENERATED_MESSAGES_FILE, []);
+  if (currentPostingIndex < messages.length) {
+    const skippedCoin = messages[currentPostingIndex];
+    addLog("warning", `MANUAL ACTION: Skipping ${skippedCoin.symbol} (${skippedCoin.name}) on demand.`);
+    currentPostingIndex++;
+    writeJsonFile(POST_PROGRESS_FILE, { next_index: currentPostingIndex });
+    res.json({ success: true, message: `Skipped ${skippedCoin.symbol}. Next index: ${currentPostingIndex}`, nextIndex: currentPostingIndex });
+  } else {
+    res.status(400).json({ error: "Cannot skip. Already at the end of the batch!" });
+  }
+});
+
+// Endpoint to reset progress back to index 0
+app.post("/api/reset-progress", (req, res) => {
+  currentPostingIndex = 0;
+  writeJsonFile(POST_PROGRESS_FILE, { next_index: 0 });
+  addLog("info", "MANUAL ACTION: Posting progress index reset to 0.");
+  res.json({ success: true, message: "Posting progress reset to 0.", nextIndex: 0 });
 });
 
 // 10. Full flow execution

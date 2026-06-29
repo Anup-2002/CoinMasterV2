@@ -536,6 +536,42 @@ export default function App() {
     }
   };
 
+  // Skip current coin in progress
+  const handleSkipCoin = async () => {
+    try {
+      const res = await fetch("/api/skip-coin", { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        // Clear cached local storage index to ensure sync
+        localStorage.setItem("posting_progress_index", String(data.nextIndex));
+        setProgressIndex(data.nextIndex);
+        fetchStats();
+      } else {
+        const err = await res.json();
+        alert(err.error || "Failed to skip coin.");
+      }
+    } catch (error) {
+      console.error("Error skipping coin:", error);
+    }
+  };
+
+  // Reset entire posting progress back to 0
+  const handleResetProgress = async () => {
+    if (!confirm("Are you sure you want to reset the posting progress back to the first coin?")) {
+      return;
+    }
+    try {
+      const res = await fetch("/api/reset-progress", { method: "POST" });
+      if (res.ok) {
+        localStorage.setItem("posting_progress_index", "0");
+        setProgressIndex(0);
+        fetchStats();
+      }
+    } catch (error) {
+      console.error("Error resetting progress:", error);
+    }
+  };
+
   // Log filter Logic
   const filteredLogs = logsList.filter(l => {
     if (logFilter === "all") return true;
@@ -870,16 +906,42 @@ export default function App() {
               </div>
             </div>
 
-            <div className="pt-4 border-t border-slate-800 space-y-2">
-              <div className="flex justify-between text-xs font-mono">
-                <span className="text-slate-400">Batch progress:</span>
-                <span className="text-emerald-400 font-bold">{totalCoins > 0 ? Math.round((progressIndex / totalCoins) * 100) : 0}%</span>
+            <div className="pt-4 border-t border-slate-800 space-y-4">
+              <div className="space-y-2">
+                <div className="flex justify-between text-xs font-mono">
+                  <span className="text-slate-400">Batch progress:</span>
+                  <span className="text-emerald-400 font-bold">{totalCoins > 0 ? Math.round((progressIndex / totalCoins) * 100) : 0}%</span>
+                </div>
+                <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-850">
+                  <div
+                    className="bg-gradient-to-r from-emerald-500 to-teal-500 h-full transition-all duration-500"
+                    style={{ width: `${totalCoins > 0 ? (progressIndex / totalCoins) * 100 : 0}%` }}
+                  ></div>
+                </div>
               </div>
-              <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-850">
-                <div
-                  className="bg-gradient-to-r from-emerald-500 to-teal-500 h-full transition-all duration-500"
-                  style={{ width: `${totalCoins > 0 ? (progressIndex / totalCoins) * 100 : 0}%` }}
-                ></div>
+
+              {/* Bot Control Actions for Handling Captchas / Blocks */}
+              <div className="grid grid-cols-2 gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={handleSkipCoin}
+                  disabled={status === "Posting" || progressIndex >= totalCoins}
+                  className="py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-100 hover:text-white transition flex items-center justify-center gap-1.5 font-bold text-[11px] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                  title="Skip the current coin if it triggers a captcha or rate limit block"
+                >
+                  <ChevronRight className="h-3.5 w-3.5 text-amber-400" />
+                  Skip Coin
+                </button>
+                <button
+                  type="button"
+                  onClick={handleResetProgress}
+                  disabled={status === "Posting" || progressIndex === 0}
+                  className="py-2 px-3 rounded-xl bg-red-950/20 hover:bg-red-950/40 text-red-400 border border-red-900/30 hover:border-red-900/50 transition flex items-center justify-center gap-1.5 font-bold text-[11px] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                  title="Reset the posting progress index to 0 (first coin)"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Reset progress
+                </button>
               </div>
             </div>
           </section>

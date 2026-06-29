@@ -182,6 +182,26 @@ export default function App() {
         const data = await res.json();
         setSessionExists(data.exists);
         setSessionDetails(data.details);
+
+        // Auto-restore session from localStorage if missing on server
+        if (!data.exists) {
+          const savedSession = localStorage.getItem("cmc_auth_state");
+          if (savedSession) {
+            console.log("Auto-restoring cookie session from local storage...");
+            await fetch("/api/save-session", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ stateJson: savedSession })
+            });
+            // Re-fetch to update state
+            const secondaryRes = await fetch("/api/get-session");
+            if (secondaryRes.ok) {
+              const secondaryData = await secondaryRes.json();
+              setSessionExists(secondaryData.exists);
+              setSessionDetails(secondaryData.details);
+            }
+          }
+        }
       }
     } catch (_) {}
   };
@@ -198,26 +218,120 @@ export default function App() {
         setGeneratedCount(data.generatedMessages);
         setPostedCount(data.postedCount);
         setFailedCount(data.failedCount);
-        setResults(data.results || []);
-        setProgressIndex(data.progressIndex);
         setCurrentCoin(data.currentCoin);
         setSessionStatus(data.sessionStatus);
         setApiStatus(data.apiStatus || { openai: false, cmc: false });
+
+        // Restore or Save Results
+        const sResults = data.results || [];
+        if (sResults.length > 0) {
+          setResults(sResults);
+          localStorage.setItem("posting_results", JSON.stringify(sResults));
+        } else {
+          const cached = localStorage.getItem("posting_results");
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setResults(parsed);
+              // Restore back to server
+              fetch("/api/save-results", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ results: parsed })
+              });
+            }
+          } else {
+            setResults([]);
+          }
+        }
+
+        // Restore or Save Progress Index
+        const sProgress = data.progressIndex || 0;
+        if (sProgress > 0) {
+          setProgressIndex(sProgress);
+          localStorage.setItem("posting_progress_index", String(sProgress));
+        } else {
+          const cached = localStorage.getItem("posting_progress_index");
+          if (cached) {
+            const parsed = Number(cached);
+            if (!isNaN(parsed) && parsed > 0) {
+              setProgressIndex(parsed);
+              // Restore back to server
+              fetch("/api/save-progress", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ index: parsed })
+              });
+            }
+          } else {
+            setProgressIndex(0);
+          }
+        }
       }
     } catch (_) {}
   };
 
   // Load Data lists on mount, status change or tab change to prevent vanishing
-  const fetchLists = () => {
-    fetch("/output/last_trending.json")
-      .then(res => (res.ok ? res.json() : []))
-      .then(data => setCoinsList(Array.isArray(data) ? data : []))
-      .catch(() => setCoinsList([]));
+  const fetchLists = async () => {
+    try {
+      // 1. Fetch trending coins from API
+      const resCoins = await fetch("/api/data/trending-coins");
+      let coins = [];
+      if (resCoins.ok) {
+        coins = await resCoins.json();
+      }
+      if (Array.isArray(coins) && coins.length > 0) {
+        setCoinsList(coins);
+        localStorage.setItem("last_trending_coins", JSON.stringify(coins));
+      } else {
+        // If server returned empty, check browser local storage cache
+        const cached = localStorage.getItem("last_trending_coins");
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setCoinsList(parsed);
+            // Restore back to server
+            fetch("/api/save-trending-coins", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ coins: parsed })
+            });
+          }
+        } else {
+          setCoinsList([]);
+        }
+      }
 
-    fetch("/output/generated_messages.json")
-      .then(res => (res.ok ? res.json() : []))
-      .then(data => setMessagesList(Array.isArray(data) ? data : []))
-      .catch(() => setMessagesList([]));
+      // 2. Fetch generated messages from API
+      const resMsg = await fetch("/api/data/generated-messages");
+      let messages = [];
+      if (resMsg.ok) {
+        messages = await resMsg.json();
+      }
+      if (Array.isArray(messages) && messages.length > 0) {
+        setMessagesList(messages);
+        localStorage.setItem("generated_comments", JSON.stringify(messages));
+      } else {
+        // If server returned empty, check browser local storage cache
+        const cached = localStorage.getItem("generated_comments");
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setMessagesList(parsed);
+            // Restore back to server
+            fetch("/api/save-generated-messages", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ messages: parsed })
+            });
+          }
+        } else {
+          setMessagesList([]);
+        }
+      }
+    } catch (err) {
+      console.error("Error fetching or restoring lists:", err);
+    }
   };
 
   useEffect(() => {
@@ -247,6 +361,19 @@ export default function App() {
   const runCommand = async (endpoint: string, pendingKey: keyof typeof isPending) => {
     setIsPending(prev => ({ ...prev, [pendingKey]: true }));
     try {
+      if (endpoint.includes("clear-session")) {
+        localStorage.removeItem("cmc_auth_state");
+      }
+      if (endpoint.includes("clear-all")) {
+        localStorage.removeItem("last_trending_coins");
+        localStorage.removeItem("generated_comments");
+        localStorage.removeItem("posting_results");
+        localStorage.removeItem("posting_progress_index");
+        setCoinsList([]);
+        setMessagesList([]);
+        setResults([]);
+        setProgressIndex(0);
+      }
       const res = await fetch(endpoint, { method: "POST" });
       const data = await res.json();
       fetchStats();
@@ -272,6 +399,7 @@ export default function App() {
         body: JSON.stringify({ stateJson: sessionJson })
       });
       if (res.ok) {
+        localStorage.setItem("cmc_auth_state", sessionJson);
         setSessionJson("");
         setShowSessionModal(false);
         fetchSessionDetails();

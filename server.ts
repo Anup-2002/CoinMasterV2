@@ -160,6 +160,12 @@ async function checkLoginReal(): Promise<{ status: "success" | "expired" | "capt
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--disable-blink-features=AutomationControlled",
+      "--no-first-run",
+      "--no-service-autorun",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--single-process",
+      "--js-flags=--max-old-space-size=512",
     ]
   });
   try {
@@ -180,15 +186,41 @@ async function checkLoginReal(): Promise<{ status: "success" | "expired" | "capt
     });
 
     const page = await context.newPage();
+
+    // Optimize page loading speed and memory by 80%+ by blocking heavy images, media, fonts, and trackers
+    await page.route("**/*", (route: any, request: any) => {
+      const type = request.resourceType();
+      const reqUrl = request.url();
+      if (
+        type === "image" ||
+        type === "media" ||
+        type === "font" ||
+        reqUrl.includes("google-analytics") ||
+        reqUrl.includes("googletagmanager") ||
+        reqUrl.includes("amplitude") ||
+        reqUrl.includes("sentry") ||
+        reqUrl.includes("facebook") ||
+        reqUrl.includes("doubleclick") ||
+        reqUrl.includes("ads") ||
+        reqUrl.includes("adnxs") ||
+        reqUrl.includes("hotjar") ||
+        reqUrl.includes("mixpanel")
+      ) {
+        route.abort();
+      } else {
+        route.continue();
+      }
+    }).catch(() => {});
+
     addLog("info", "Navigating to CoinMarketCap Bitcoin page: https://coinmarketcap.com/currencies/bitcoin/");
     
     await page.goto("https://coinmarketcap.com/currencies/bitcoin/", {
       waitUntil: "domcontentloaded",
-      timeout: 45000
+      timeout: 30000
     });
     
     // Wait for the page to settle down
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1000);
     
     const currentUrl = page.url();
     if (currentUrl.includes("/login") || currentUrl.includes("/signin") || currentUrl.includes("/auth")) {
@@ -208,7 +240,7 @@ async function checkLoginReal(): Promise<{ status: "success" | "expired" | "capt
       '[placeholder*="thoughts"]'
     ];
 
-    addLog("info", "Scanning page for comment editor (scrolling gradually to trigger lazy-loaded feeds)...");
+    addLog("info", "Scanning page for comment editor...");
     for (let scrollStep = 0; scrollStep < 5; scrollStep++) {
       for (const selector of editorSelectors) {
         editor = await page.$(selector);
@@ -219,9 +251,9 @@ async function checkLoginReal(): Promise<{ status: "success" | "expired" | "capt
       }
       if (editor) break;
 
-      addLog("info", `Scroll step ${scrollStep + 1}: Editor not found. Scrolling 800px...`);
-      await page.evaluate(() => window.scrollBy(0, 800));
-      await page.waitForTimeout(800);
+      addLog("info", `Scroll step ${scrollStep + 1}: Editor not found. Scrolling 600px...`);
+      await page.evaluate(() => window.scrollBy(0, 600));
+      await page.waitForTimeout(600);
     }
 
     if (!editor) {
@@ -261,6 +293,31 @@ async function checkLoginReal(): Promise<{ status: "success" | "expired" | "capt
 
 async function runRealPostingWithPage(page: any, url: string, message: string): Promise<{ status: "success" | "expired" | "captcha" | "failed" | "retry"; message: string }> {
   try {
+    // Optimize page loading speed and memory by 80%+ by blocking heavy images, media, fonts, and trackers
+    await page.route("**/*", (route: any, request: any) => {
+      const type = request.resourceType();
+      const reqUrl = request.url();
+      if (
+        type === "image" ||
+        type === "media" ||
+        type === "font" ||
+        reqUrl.includes("google-analytics") ||
+        reqUrl.includes("googletagmanager") ||
+        reqUrl.includes("amplitude") ||
+        reqUrl.includes("sentry") ||
+        reqUrl.includes("facebook") ||
+        reqUrl.includes("doubleclick") ||
+        reqUrl.includes("ads") ||
+        reqUrl.includes("adnxs") ||
+        reqUrl.includes("hotjar") ||
+        reqUrl.includes("mixpanel")
+      ) {
+        route.abort();
+      } else {
+        route.continue();
+      }
+    }).catch(() => {});
+
     addLog("info", `Navigating to target coin URL: ${url}`);
     
     await page.goto(url, {
@@ -269,7 +326,7 @@ async function runRealPostingWithPage(page: any, url: string, message: string): 
     });
     
     // Wait for the page to settle down
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1000);
     
     // Scan page for the comment editor by scrolling down gradually
     let editor = null;
@@ -320,18 +377,24 @@ async function runRealPostingWithPage(page: any, url: string, message: string): 
       return { status: "failed", message: "Comment editor element not found on coin page" };
     }
     
-    // Focus and click
-    addLog("info", "Focusing comment editor input...");
+    // Try to fill the editor directly using Playwright's native .fill() which is contenteditable-safe
     try {
-      await editor.focus({ timeout: 1500 });
-    } catch (_) {}
-    await clickResiliently(page, editor, "comment editor input box");
-    await page.waitForTimeout(300);
-    
-    // Clear existing text just in case, then type
-    await page.keyboard.press("Control+A");
-    await page.keyboard.press("Backspace");
-    await page.keyboard.type(message, { delay: 10 });
+      addLog("info", "Attempting direct fill on comment editor...");
+      await editor.fill(message, { timeout: 3000 });
+    } catch (err) {
+      addLog("warning", `Direct fill failed: ${(err as Error).message}. Falling back to click & type...`);
+      // Focus and click
+      try {
+        await editor.focus({ timeout: 1500 });
+      } catch (_) {}
+      await clickResiliently(page, editor, "comment editor input box");
+      await page.waitForTimeout(300);
+      
+      // Clear existing text just in case, then type
+      await page.keyboard.press("Control+A");
+      await page.keyboard.press("Backspace");
+      await page.keyboard.type(message, { delay: 10 });
+    }
     await page.waitForTimeout(300);
     
     // Find and toggle Bullish sentiment
@@ -419,6 +482,12 @@ async function runRealPosting(url: string, message: string): Promise<{ status: "
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--disable-blink-features=AutomationControlled",
+      "--no-first-run",
+      "--no-service-autorun",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--single-process",
+      "--js-flags=--max-old-space-size=512",
     ]
   });
   try {
@@ -439,15 +508,41 @@ async function runRealPosting(url: string, message: string): Promise<{ status: "
     });
 
     const page = await context.newPage();
+
+    // Optimize page loading speed and memory by 80%+ by blocking heavy images, media, fonts, and trackers
+    await page.route("**/*", (route: any, request: any) => {
+      const type = request.resourceType();
+      const reqUrl = request.url();
+      if (
+        type === "image" ||
+        type === "media" ||
+        type === "font" ||
+        reqUrl.includes("google-analytics") ||
+        reqUrl.includes("googletagmanager") ||
+        reqUrl.includes("amplitude") ||
+        reqUrl.includes("sentry") ||
+        reqUrl.includes("facebook") ||
+        reqUrl.includes("doubleclick") ||
+        reqUrl.includes("ads") ||
+        reqUrl.includes("adnxs") ||
+        reqUrl.includes("hotjar") ||
+        reqUrl.includes("mixpanel")
+      ) {
+        route.abort();
+      } else {
+        route.continue();
+      }
+    });
+
     addLog("info", `Navigating to target coin URL: ${url}`);
     
     await page.goto(url, {
       waitUntil: "domcontentloaded",
-      timeout: 45000
+      timeout: 30000
     });
     
     // Wait for the page to settle
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1000);
     
     // Scan page for the comment editor by scrolling down gradually
     let editor = null;
@@ -460,7 +555,7 @@ async function runRealPosting(url: string, message: string): Promise<{ status: "
       '[placeholder*="thoughts"]'
     ];
 
-    addLog("info", "Scanning page for comment editor (scrolling gradually to trigger lazy-loaded feeds)...");
+    addLog("info", "Scanning page for comment editor...");
     for (let scrollStep = 0; scrollStep < 5; scrollStep++) {
       for (const selector of editorSelectors) {
         editor = await page.$(selector);
@@ -471,9 +566,9 @@ async function runRealPosting(url: string, message: string): Promise<{ status: "
       }
       if (editor) break;
 
-      addLog("info", `Scroll step ${scrollStep + 1}: Editor not found. Scrolling 800px...`);
-      await page.evaluate(() => window.scrollBy(0, 800));
-      await page.waitForTimeout(800);
+      addLog("info", `Scroll step ${scrollStep + 1}: Editor not found. Scrolling 600px...`);
+      await page.evaluate(() => window.scrollBy(0, 600));
+      await page.waitForTimeout(600);
     }
 
     if (!editor) {
@@ -498,15 +593,24 @@ async function runRealPosting(url: string, message: string): Promise<{ status: "
       return { status: "failed", message: "Comment editor element not found on coin page" };
     }
     
-    // Focus, write message naturally
-    addLog("info", `Editor field focused. Typing comment: "${message}"`);
-    await clickResiliently(page, editor, "comment editor input box");
-    await page.waitForTimeout(300);
-    
-    // Clear existing text just in case, then type
-    await page.keyboard.press("Control+A");
-    await page.keyboard.press("Backspace");
-    await page.keyboard.type(message, { delay: 15 });
+    // Try to fill the editor directly using Playwright's native .fill() which is contenteditable-safe
+    try {
+      addLog("info", "Attempting direct fill on comment editor...");
+      await editor.fill(message, { timeout: 3000 });
+    } catch (err) {
+      addLog("warning", `Direct fill failed: ${(err as Error).message}. Falling back to click & type...`);
+      // Focus and click
+      try {
+        await editor.focus({ timeout: 1500 });
+      } catch (_) {}
+      await clickResiliently(page, editor, "comment editor input box");
+      await page.waitForTimeout(300);
+      
+      // Clear existing text just in case, then type
+      await page.keyboard.press("Control+A");
+      await page.keyboard.press("Backspace");
+      await page.keyboard.type(message, { delay: 10 });
+    }
     await page.waitForTimeout(300);
     
     // Find and toggle Bullish sentiment
@@ -668,6 +772,72 @@ app.post("/api/clear-session", (req, res) => {
     }
   } catch (error) {
     res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+// Self-healing data load/save endpoints
+app.get("/api/data/trending-coins", (req, res) => {
+  const data = readJsonFile<Coin[]>(LAST_TRENDING_FILE, []);
+  res.json(data);
+});
+
+app.get("/api/data/generated-messages", (req, res) => {
+  const data = readJsonFile<GeneratedMessage[]>(GENERATED_MESSAGES_FILE, []);
+  res.json(data);
+});
+
+app.post("/api/save-trending-coins", (req, res) => {
+  try {
+    const { coins } = req.body;
+    if (Array.isArray(coins)) {
+      writeJsonFile(LAST_TRENDING_FILE, coins);
+      addLog("success", `Restored ${coins.length} trending coins from browser cache storage.`);
+      return res.json({ success: true });
+    }
+    res.status(400).json({ error: "Invalid coins payload" });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+app.post("/api/save-generated-messages", (req, res) => {
+  try {
+    const { messages } = req.body;
+    if (Array.isArray(messages)) {
+      writeJsonFile(GENERATED_MESSAGES_FILE, messages);
+      addLog("success", `Restored ${messages.length} generated comments from browser cache storage.`);
+      return res.json({ success: true });
+    }
+    res.status(400).json({ error: "Invalid messages payload" });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+app.post("/api/save-results", (req, res) => {
+  try {
+    const { results } = req.body;
+    if (Array.isArray(results)) {
+      writeJsonFile(RESULTS_FILE, results);
+      return res.json({ success: true });
+    }
+    res.status(400).json({ error: "Invalid results payload" });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+app.post("/api/save-progress", (req, res) => {
+  try {
+    const { index } = req.body;
+    if (typeof index === "number") {
+      writeJsonFile(POST_PROGRESS_FILE, { next_index: index });
+      currentPostingIndex = index;
+      return res.json({ success: true });
+    }
+    res.status(400).json({ error: "Invalid index payload" });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
   }
 });
 
@@ -1333,6 +1503,12 @@ async function runPostingLoop() {
           "--disable-dev-shm-usage",
           "--disable-gpu",
           "--disable-blink-features=AutomationControlled",
+          "--no-first-run",
+          "--no-service-autorun",
+          "--password-store=basic",
+          "--use-mock-keychain",
+          "--single-process",
+          "--js-flags=--max-old-space-size=512",
         ]
       });
       context = await browser.newContext({

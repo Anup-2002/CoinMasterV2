@@ -8,8 +8,8 @@ services:
       - key: PORT
         value: "3000"
       - key: GEMINI_API_KEY
-        sync: true
+        value: "AIzaSyAzdveB2qzIKaITM8vhYy1kVsQPQclGW6c"
       - key: OPENAI_API_KEY
-        sync: true
+        value: "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"
       - key: CMC_API_KEY
-        sync: true
+        value: "18ce307ceff043149c07ebf4a02879c1"

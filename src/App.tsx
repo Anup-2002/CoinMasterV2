@@ -80,6 +80,16 @@ export default function App() {
   const [sessionDetails, setSessionDetails] = useState<any>(null);
   const [showSessionModal, setShowSessionModal] = useState<boolean>(false);
 
+  // Automated Playwright Login States
+  const [sessionModalTab, setSessionModalTab] = useState<"manual" | "automated">("manual");
+  const [loginEmail, setLoginEmail] = useState<string>("");
+  const [loginPassword, setLoginPassword] = useState<string>("");
+  const [loginStatus, setLoginStatus] = useState<string>("");
+  const [loginSessionId, setLoginSessionId] = useState<string>("");
+  const [requiresOtp, setRequiresOtp] = useState<boolean>(false);
+  const [otpCode, setOtpCode] = useState<string>("");
+  const [isLoggingIn, setIsLoggingIn] = useState<boolean>(false);
+
   // Logs state
   const [logsList, setLogsList] = useState<LogEntry[]>([]);
   const [logFilter, setLogFilter] = useState<string>("all");
@@ -412,6 +422,100 @@ export default function App() {
       alert("Error saving session: " + (error as Error).message);
     } finally {
       setIsPending(prev => ({ ...prev, login: false }));
+    }
+  };
+
+  // Automated Playwright login handlers
+  const handleInitiateLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!loginEmail.trim() || !loginPassword.trim()) {
+      setLoginStatus("Email and password are required.");
+      return;
+    }
+    setIsLoggingIn(true);
+    setLoginStatus("Launching browser on backend and logging in... (may take 10-20s)");
+    setRequiresOtp(false);
+    setLoginSessionId("");
+    
+    try {
+      const res = await fetch("/api/login/initiate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: loginEmail, password: loginPassword })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setLoginStatus(data.error || "Failed to initiate login.");
+        return;
+      }
+
+      if (data.status === "success") {
+        setLoginStatus("Success! Logged in and saved session.");
+        fetchSessionDetails();
+        fetchStats();
+        setTimeout(() => {
+          setShowSessionModal(false);
+          // Reset states
+          setLoginEmail("");
+          setLoginPassword("");
+          setLoginStatus("");
+        }, 2000);
+      } else if (data.status === "otp_required") {
+        setLoginStatus(data.message);
+        setLoginSessionId(data.loginSessionId);
+        setRequiresOtp(true);
+      } else {
+        setLoginStatus(data.message || "Failed to log in automatically.");
+      }
+    } catch (error) {
+      setLoginStatus("Error initiating login: " + (error as Error).message);
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleSubmitOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!otpCode.trim()) {
+      setLoginStatus("Please enter the verification code.");
+      return;
+    }
+    setIsLoggingIn(true);
+    setLoginStatus("Verifying OTP code and finalising login session...");
+
+    try {
+      const res = await fetch("/api/login/submit-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ loginSessionId, otp: otpCode })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setLoginStatus(data.error || "Failed to verify OTP.");
+        return;
+      }
+
+      if (data.status === "success") {
+        setLoginStatus("Success! Logged in and saved session.");
+        fetchSessionDetails();
+        fetchStats();
+        setTimeout(() => {
+          setShowSessionModal(false);
+          // Reset states
+          setLoginEmail("");
+          setLoginPassword("");
+          setLoginStatus("");
+          setRequiresOtp(false);
+          setOtpCode("");
+          setLoginSessionId("");
+        }, 2000);
+      } else {
+        setLoginStatus(data.message || "Verification failed.");
+      }
+    } catch (error) {
+      setLoginStatus("Error submitting OTP: " + (error as Error).message);
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
@@ -1240,8 +1344,8 @@ export default function App() {
 
       {/* MODAL: PASTE COOKIE SESSION */}
       {showSessionModal && (
-        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full overflow-hidden shadow-2xl flex flex-col justify-between animate-in fade-in zoom-in-95 duration-150">
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full overflow-hidden shadow-2xl flex flex-col justify-between animate-in fade-in zoom-in-95 duration-200">
             <div className="p-5 space-y-4">
               <div className="flex items-center justify-between border-b border-slate-800 pb-3">
                 <h3 className="font-bold text-white text-sm flex items-center gap-2">
@@ -1255,33 +1359,142 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="space-y-3.5 text-xs text-slate-300">
-                <p>
-                  To post successfully from our workspace, Playwright requires a valid <strong>CoinMarketCap login cookie state</strong>.
-                </p>
-                <div className="p-3 bg-slate-950 rounded-lg border border-slate-850 space-y-1.5 text-[11px] leading-relaxed text-slate-400">
-                  <span className="font-bold text-white block">How to obtain cookies:</span>
-                  1. Log into your account on CoinMarketCap in Chrome.<br />
-                  2. Use a browser extension like "EditThisCookie" or Playwright CLI to export cookies/storage as a JSON array.<br />
-                  3. Paste the complete JSON object below.
-                </div>
-
-                <div className="p-3 bg-indigo-950/40 border border-indigo-900/50 rounded-lg space-y-1 text-[11px] leading-relaxed text-indigo-300">
-                  <span className="font-bold text-white flex items-center gap-1">💡 Persistent Render Deployments:</span>
-                  Render containers reset local files on each redeployment or restart. To persist your login session permanently, add an Environment Variable on Render with Key <code className="bg-indigo-950 px-1 py-0.5 rounded text-white font-mono font-bold">AUTH_STATE_JSON</code> and paste this complete JSON string as the Value!
-                </div>
-
-                <div className="space-y-1.5">
-                  <label className="text-[11px] uppercase text-slate-400 font-mono tracking-widest font-bold">Paste state.json content</label>
-                  <textarea
-                    rows={8}
-                    value={sessionJson}
-                    onChange={(e) => setSessionJson(e.target.value)}
-                    placeholder='{ "cookies": [ { "name": "session_token", "value": "..." } ] }'
-                    className="w-full bg-slate-950 border border-slate-800/80 rounded-xl p-3 font-mono text-[10px] text-emerald-400 focus:outline-none focus:border-emerald-500 placeholder-slate-700"
-                  />
-                </div>
+              {/* TABS SELECTOR */}
+              <div className="flex border-b border-slate-800 gap-1">
+                <button
+                  type="button"
+                  onClick={() => setSessionModalTab("manual")}
+                  className={`flex-1 pb-2 text-xs font-bold transition-all border-b-2 ${
+                    sessionModalTab === "manual"
+                      ? "text-emerald-400 border-emerald-500"
+                      : "text-slate-400 border-transparent hover:text-slate-200"
+                  }`}
+                >
+                  Option A: Paste state.json
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSessionModalTab("automated")}
+                  className={`flex-1 pb-2 text-xs font-bold transition-all border-b-2 ${
+                    sessionModalTab === "automated"
+                      ? "text-emerald-400 border-emerald-500"
+                      : "text-slate-400 border-transparent hover:text-slate-200"
+                  }`}
+                >
+                  Option B: Generate via Login
+                </button>
               </div>
+
+              {sessionModalTab === "manual" ? (
+                <div className="space-y-3.5 text-xs text-slate-300">
+                  <p>
+                    To post successfully from our workspace, Playwright requires a valid <strong>CoinMarketCap login cookie state</strong>.
+                  </p>
+                  <div className="p-3 bg-slate-950 rounded-lg border border-slate-850 space-y-1.5 text-[11px] leading-relaxed text-slate-400">
+                    <span className="font-bold text-white block">How to obtain cookies:</span>
+                    1. Log into your account on CoinMarketCap in Chrome.<br />
+                    2. Use a browser extension like "EditThisCookie" or Playwright CLI to export cookies/storage as a JSON array.<br />
+                    3. Paste the complete JSON object below.
+                  </div>
+
+                  <div className="p-3 bg-indigo-950/40 border border-indigo-900/50 rounded-lg space-y-1 text-[11px] leading-relaxed text-indigo-300">
+                    <span className="font-bold text-white flex items-center gap-1">💡 Persistent Render Deployments:</span>
+                    Render containers reset local files on each redeployment or restart. To persist your login session permanently, add an Environment Variable on Render with Key <code className="bg-indigo-950 px-1 py-0.5 rounded text-white font-mono font-bold">AUTH_STATE_JSON</code> and paste this complete JSON string as the Value!
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-[11px] uppercase text-slate-400 font-mono tracking-widest font-bold">Paste state.json content</label>
+                    <textarea
+                      rows={8}
+                      value={sessionJson}
+                      onChange={(e) => setSessionJson(e.target.value)}
+                      placeholder='{ "cookies": [ { "name": "session_token", "value": "..." } ] }'
+                      className="w-full bg-slate-950 border border-slate-800/80 rounded-xl p-3 font-mono text-[10px] text-emerald-400 focus:outline-none focus:border-emerald-500 placeholder-slate-700"
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-4 text-xs text-slate-300">
+                  <p>
+                    Enter your CoinMarketCap credentials. The backend will automatically launch a secure headless browser, authenticate, and generate the required <code className="text-emerald-400 font-mono font-bold">state.json</code> file.
+                  </p>
+
+                  {!requiresOtp ? (
+                    <form onSubmit={handleInitiateLogin} className="space-y-3.5">
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] uppercase text-slate-400 font-mono tracking-widest font-bold block">CoinMarketCap Email</label>
+                        <input
+                          type="email"
+                          required
+                          value={loginEmail}
+                          onChange={(e) => setLoginEmail(e.target.value)}
+                          placeholder="user@example.com"
+                          disabled={isLoggingIn}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-emerald-400 focus:outline-none focus:border-emerald-500 disabled:opacity-50"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] uppercase text-slate-400 font-mono tracking-widest font-bold block">Password</label>
+                        <input
+                          type="password"
+                          required
+                          value={loginPassword}
+                          onChange={(e) => setLoginPassword(e.target.value)}
+                          placeholder="••••••••••••"
+                          disabled={isLoggingIn}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-emerald-400 focus:outline-none focus:border-emerald-500 disabled:opacity-50"
+                        />
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={isLoggingIn}
+                        className="w-full py-2.5 bg-emerald-500 hover:bg-emerald-400 disabled:bg-emerald-500/50 text-slate-950 rounded-xl text-xs font-bold transition flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed"
+                      >
+                        {isLoggingIn ? "Logging in..." : "Start Automatic Login"}
+                      </button>
+                    </form>
+                  ) : (
+                    <form onSubmit={handleSubmitOtp} className="space-y-3.5">
+                      <div className="p-3 bg-amber-950/40 border border-amber-900/50 rounded-lg text-amber-300 space-y-1 text-[11px]">
+                        <span className="font-bold text-white block">Email Code Verification Required</span>
+                        CoinMarketCap has sent a security check/verification code to your email. Please check your email inbox and enter the 6-digit OTP code below.
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-[11px] uppercase text-slate-400 font-mono tracking-widest font-bold block">6-Digit OTP / Verification Code</label>
+                        <input
+                          type="text"
+                          required
+                          maxLength={6}
+                          pattern="[0-9]{6}"
+                          value={otpCode}
+                          onChange={(e) => setOtpCode(e.target.value)}
+                          placeholder="123456"
+                          disabled={isLoggingIn}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-center font-mono text-lg tracking-widest text-emerald-400 focus:outline-none focus:border-emerald-500 disabled:opacity-50"
+                        />
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={isLoggingIn}
+                        className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 disabled:bg-amber-500/50 text-slate-950 rounded-xl text-xs font-bold transition flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed"
+                      >
+                        {isLoggingIn ? "Verifying..." : "Confirm & Complete Login"}
+                      </button>
+                    </form>
+                  )}
+
+                  {loginStatus && (
+                    <div className="p-3 bg-slate-950 rounded-xl border border-slate-850 text-[11px] font-mono leading-relaxed break-all text-slate-300">
+                      <span className="font-bold text-emerald-400 block mb-1">Status Log:</span>
+                      {loginStatus}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="bg-slate-950 px-5 py-4 border-t border-slate-800 flex items-center justify-end gap-3">
@@ -1289,14 +1502,16 @@ export default function App() {
                 onClick={() => setShowSessionModal(false)}
                 className="py-2 px-4 rounded-xl text-slate-400 hover:text-white text-xs font-semibold"
               >
-                Cancel
+                Close
               </button>
-              <button
-                onClick={handleSaveSession}
-                className="py-2 px-5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl text-xs font-bold transition cursor-pointer"
-              >
-                Save & Load Session
-              </button>
+              {sessionModalTab === "manual" && (
+                <button
+                  onClick={handleSaveSession}
+                  className="py-2 px-5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl text-xs font-bold transition cursor-pointer"
+                >
+                  Save & Load Session
+                </button>
+              )}
             </div>
           </div>
         </div>

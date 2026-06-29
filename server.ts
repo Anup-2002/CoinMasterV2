@@ -621,6 +621,386 @@ const isCmcConfigured = !!process.env.CMC_API_KEY;
 addLog("info", `OpenAI API Status: ${isOpenAiConfigured ? "CONFIGURED" : "NOT CONFIGURED (Falls back to rule-based template comments)"}`);
 addLog("info", `CoinMarketCap API Status: ${isCmcConfigured ? "CONFIGURED" : "NOT CONFIGURED (Falls back to live free public crypto markets API)"}`);
 
+// Active in-memory Playwright login sessions for 2FA/OTP flow
+const activeLoginSessions: Record<string, {
+  browser: any;
+  context: any;
+  page: any;
+  email: string;
+  createdAt: number;
+}> = {};
+
+// Stale session cleanup timer
+setInterval(() => {
+  const now = Date.now();
+  for (const sessionId of Object.keys(activeLoginSessions)) {
+    const session = activeLoginSessions[sessionId];
+    if (now - session.createdAt > 300000) { // 5 minutes expiration
+      addLog("info", `Cleaning up stale automated login session for ${session.email}...`);
+      session.browser.close().catch(() => {});
+      delete activeLoginSessions[sessionId];
+    }
+  }
+}, 60000);
+
+// Automated Playwright Login initiation
+app.post("/api/login/initiate", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: "Missing email or password." });
+  }
+
+  addLog("info", `Initiating automated CoinMarketCap login for ${email}...`);
+  
+  let browser: any;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-service-autorun",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        "--single-process",
+        "--js-flags=--max-old-space-size=512",
+      ]
+    });
+
+    const context = await browser.newContext({
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      viewport: { width: 1366, height: 768 },
+      locale: "en-US",
+      timezoneId: "America/New_York",
+    });
+
+    // Stealth: hide webdriver property
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+      });
+    });
+
+    const page = await context.newPage();
+
+    addLog("info", "Navigating to CoinMarketCap login page...");
+    try {
+      await page.goto("https://coinmarketcap.com/login", {
+        waitUntil: "load",
+        timeout: 45000
+      });
+    } catch (gotoErr) {
+      addLog("warning", `Standard page load failed: ${(gotoErr as Error).message}. Retrying with domcontentloaded...`);
+      await page.goto("https://coinmarketcap.com/login", {
+        waitUntil: "domcontentloaded",
+        timeout: 25000
+      }).catch(() => {});
+    }
+
+    // Wait for the email input field to appear dynamically
+    const combinedEmailSelector = 'input[type="email"], input[placeholder*="email" i], input[placeholder*="Email" i], input[name="email"], #email, input[type="text"]';
+    try {
+      await page.waitForSelector(combinedEmailSelector, { timeout: 15000 });
+    } catch (waitForErr) {
+      addLog("warning", `Timeout waiting for any email input selectors to appear: ${(waitForErr as Error).message}. Attempting to process page anyway.`);
+    }
+
+    await page.waitForTimeout(1500);
+
+    const emailSelectors = [
+      'input[type="email"]',
+      'input[placeholder*="email" i]',
+      'input[placeholder*="Email" i]',
+      'input[name="email"]',
+      '#email',
+      'input[type="text"]'
+    ];
+    let emailInput = null;
+    for (const selector of emailSelectors) {
+      emailInput = await page.$(selector);
+      if (emailInput) {
+        addLog("info", `Located email input field with selector: ${selector}`);
+        break;
+      }
+    }
+
+    const passwordSelectors = [
+      'input[type="password"]',
+      'input[placeholder*="password" i]',
+      'input[placeholder*="Password" i]',
+      'input[name="password"]',
+      '#password'
+    ];
+    let passwordInput = null;
+    for (const selector of passwordSelectors) {
+      passwordInput = await page.$(selector);
+      if (passwordInput) {
+        addLog("info", `Located password input field with selector: ${selector}`);
+        break;
+      }
+    }
+
+    if (!emailInput || !passwordInput) {
+      const currentUrl = page.url();
+      const title = await page.title().catch(() => "");
+      const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+      const textSample = pageText.substring(0, 800).replace(/\n/g, " ");
+      
+      addLog("error", `Failed to locate login input fields. Current URL: ${currentUrl}, Page Title: "${title}", Text Snip: "${textSample}"`);
+      
+      const isCf = title.includes("Cloudflare") || title.includes("Just a moment") || pageText.includes("cloudflare") || pageText.includes("turnstile") || pageText.includes("are you human");
+      const isBlockPage = pageText.includes("something went wrong") || pageText.includes("try again later") || pageText.includes("download app");
+      
+      await browser.close().catch(() => {});
+      
+      let friendlyMessage = "";
+      if (isCf) {
+        friendlyMessage = "⚠️ Blocked by Cloudflare/Turnstile bot protection. Please use 'Option A: Paste state.json' to securely upload your browser cookies, which bypasses automated login blocks.";
+      } else if (isBlockPage) {
+        friendlyMessage = "⚠️ CoinMarketCap blocked the automated browser login from our server's hosting IP address (Oops page). Please use 'Option A: Paste state.json' to import your logged-in cookies instead—this is 100% reliable!";
+      } else {
+        friendlyMessage = `⚠️ Failed to locate email/password input fields (Page Title: "${title}"). CoinMarketCap may have loaded an alternative layout. Please use 'Option A: Paste state.json' to bypass this and login instantly.`;
+      }
+      
+      return res.json({
+        status: "failed",
+        message: friendlyMessage
+      });
+    }
+
+    addLog("info", "Entering email and password...");
+    await emailInput.focus();
+    await page.keyboard.press("Control+A");
+    await page.keyboard.press("Backspace");
+    await page.keyboard.type(email, { delay: 45 });
+
+    await page.waitForTimeout(300);
+
+    await passwordInput.focus();
+    await page.keyboard.press("Control+A");
+    await page.keyboard.press("Backspace");
+    await page.keyboard.type(password, { delay: 55 });
+
+    await page.waitForTimeout(500);
+
+    const submitBtnSelectors = [
+      'button[type="submit"]',
+      'button:has-text("Log In")',
+      'button:has-text("Login")',
+      '.login-button',
+      'form button'
+    ];
+    let submitBtn = null;
+    for (const selector of submitBtnSelectors) {
+      submitBtn = await page.$(selector);
+      if (submitBtn) break;
+    }
+
+    addLog("info", "Submitting login form...");
+    if (submitBtn) {
+      await submitBtn.click({ force: true }).catch(() => submitBtn.dispatchEvent("click"));
+    } else {
+      await page.keyboard.press("Enter");
+    }
+
+    // Wait for response/navigation
+    await page.waitForTimeout(5000);
+
+    const pageText = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
+    
+    // Check if Cloudflare / Captcha is shown
+    const captchaKeywords = [
+      "captcha",
+      "verify you are human",
+      "security check",
+      "cloudflare",
+      "challenge",
+      "checking your browser",
+      "are you a robot"
+    ];
+    for (const word of captchaKeywords) {
+      if (pageText.includes(word)) {
+        addLog("error", `Captcha detected during login: "${word}"`);
+        await browser.close().catch(() => {});
+        return res.json({
+          status: "captcha",
+          message: `Blocked by verification challenge: "${word}". Please solve it or upload state.json manually.`
+        });
+      }
+    }
+
+    // Check if OTP/Verification is requested
+    const otpKeywords = [
+      "verification code",
+      "security verification",
+      "check your email",
+      "we sent a code",
+      "enter verification",
+      "6-digit"
+    ];
+    let otpRequested = false;
+    for (const word of otpKeywords) {
+      if (pageText.includes(word)) {
+        otpRequested = true;
+        break;
+      }
+    }
+
+    const codeInputs = await page.$$('input[placeholder*="code" i], input[autocomplete*="one-time-code"], input[type="text"]');
+    if (otpRequested || codeInputs.length >= 1) {
+      const loginSessionId = "session_" + Math.random().toString(36).substring(2, 15);
+      activeLoginSessions[loginSessionId] = {
+        browser,
+        context,
+        page,
+        email,
+        createdAt: Date.now(),
+      };
+      addLog("warning", "CoinMarketCap requires email OTP verification. Please supply the code sent to your email.");
+      return res.json({
+        status: "otp_required",
+        loginSessionId,
+        message: "OTP required: A verification code was sent to your CoinMarketCap email. Please enter it below."
+      });
+    }
+
+    const currentUrl = page.url();
+    const cookies = await context.cookies();
+    const hasAuthCookie = cookies.some((c: any) => c.name.includes("session") || c.name.includes("token") || c.name.includes("auth"));
+
+    if (!currentUrl.includes("/login") && !currentUrl.includes("/signin") && hasAuthCookie) {
+      const state = await context.storageState();
+      fs.writeFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+      addLog("success", `Login successful! auth/state.json generated and saved for ${email}.`);
+      await browser.close().catch(() => {});
+      return res.json({
+        status: "success",
+        message: "Successfully logged in and generated session!"
+      });
+    }
+
+    addLog("error", `Login failed. Still on URL: ${currentUrl}`);
+    await browser.close().catch(() => {});
+    return res.json({
+      status: "failed",
+      message: "Login failed. Please verify your email and password are correct."
+    });
+
+  } catch (err) {
+    addLog("error", `Automated login error: ${(err as Error).message}`);
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+    return res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// Submit OTP for automated login
+app.post("/api/login/submit-otp", async (req, res) => {
+  const { loginSessionId, otp } = req.body;
+  if (!loginSessionId || !otp) {
+    return res.status(400).json({ error: "Missing loginSessionId or OTP code." });
+  }
+
+  const session = activeLoginSessions[loginSessionId];
+  if (!session) {
+    return res.status(400).json({ error: "Login session expired or invalid. Please request a new code." });
+  }
+
+  addLog("info", `Submitting OTP code for login session...`);
+  const { browser, context, page, email } = session;
+
+  try {
+    const otpInputs = await page.$$('input[type="text"], input[type="tel"], input[placeholder*="code" i], input[placeholder*="Verification" i]');
+    
+    if (otpInputs.length === 6) {
+      addLog("info", "Entering 6-digit OTP code into individual inputs...");
+      for (let i = 0; i < 6; i++) {
+        if (otp[i]) {
+          await otpInputs[i].focus();
+          await otpInputs[i].fill(otp[i]);
+          await page.waitForTimeout(100);
+        }
+      }
+    } else if (otpInputs.length > 0) {
+      addLog("info", "Entering OTP code into the code input field...");
+      await otpInputs[0].focus();
+      await page.keyboard.press("Control+A");
+      await page.keyboard.press("Backspace");
+      await page.keyboard.type(otp, { delay: 50 });
+    } else {
+      addLog("info", "Typing OTP code onto the page directly...");
+      await page.keyboard.type(otp, { delay: 50 });
+    }
+
+    await page.waitForTimeout(500);
+
+    const submitBtn = await page.$('button:has-text("Submit"), button:has-text("Verify"), button:has-text("Confirm"), button[type="submit"]');
+    if (submitBtn) {
+      addLog("info", "Clicking verification submit button...");
+      await submitBtn.click({ force: true }).catch(() => submitBtn.dispatchEvent("click"));
+    } else {
+      addLog("info", "Pressing Enter to submit verification code...");
+      await page.keyboard.press("Enter");
+    }
+
+    await page.waitForTimeout(5000);
+
+    const cookies = await context.cookies();
+    const hasAuthCookie = cookies.some((c: any) => c.name.includes("session") || c.name.includes("token") || c.name.includes("auth"));
+    const currentUrl = page.url();
+
+    if (!currentUrl.includes("/login") && !currentUrl.includes("/signin")) {
+      const state = await context.storageState();
+      fs.writeFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+      addLog("success", `OTP Verification successful! auth/state.json generated and saved for ${email}.`);
+      await browser.close().catch(() => {});
+      delete activeLoginSessions[loginSessionId];
+      return res.json({
+        status: "success",
+        message: "Successfully logged in and generated session!"
+      });
+    }
+
+    addLog("info", "Double-checking authentication state against Bitcoin currency page...");
+    await page.goto("https://coinmarketcap.com/currencies/bitcoin/", {
+      waitUntil: "domcontentloaded",
+      timeout: 15000
+    }).catch(() => {});
+
+    const updatedUrl = page.url();
+    if (!updatedUrl.includes("/login") && !updatedUrl.includes("/signin") && !updatedUrl.includes("/auth")) {
+      const state = await context.storageState();
+      fs.writeFileSync(AUTH_STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+      addLog("success", `Login confirmed! auth/state.json saved for ${email}.`);
+      await browser.close().catch(() => {});
+      delete activeLoginSessions[loginSessionId];
+      return res.json({
+        status: "success",
+        message: "Successfully logged in and generated session!"
+      });
+    }
+
+    addLog("error", "Verification failed. Code might be expired, incorrect, or blocked.");
+    await browser.close().catch(() => {});
+    delete activeLoginSessions[loginSessionId];
+    return res.json({
+      status: "failed",
+      message: "Verification failed. The code may be incorrect or expired. Please start over."
+    });
+
+  } catch (err) {
+    addLog("error", `Error processing OTP: ${(err as Error).message}`);
+    await browser.close().catch(() => {});
+    delete activeLoginSessions[loginSessionId];
+    return res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 // ============================================================================
 // API ENDPOINTS
 // ============================================================================

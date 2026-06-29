@@ -207,19 +207,21 @@ export default function App() {
     } catch (_) {}
   };
 
-  // Lazy Load Data lists based on Active Tab
+  // Load Data lists on mount, status change or tab change to prevent vanishing
+  const fetchLists = () => {
+    fetch("/output/last_trending.json")
+      .then(res => (res.ok ? res.json() : []))
+      .then(data => setCoinsList(Array.isArray(data) ? data : []))
+      .catch(() => setCoinsList([]));
+
+    fetch("/output/generated_messages.json")
+      .then(res => (res.ok ? res.json() : []))
+      .then(data => setMessagesList(Array.isArray(data) ? data : []))
+      .catch(() => setMessagesList([]));
+  };
+
   useEffect(() => {
-    if (activeTab === "coins") {
-      fetch("/output/last_trending.json")
-        .then(res => (res.ok ? res.json() : []))
-        .then(data => setCoinsList(Array.isArray(data) ? data : []))
-        .catch(() => setCoinsList([]));
-    } else if (activeTab === "comments") {
-      fetch("/output/generated_messages.json")
-        .then(res => (res.ok ? res.json() : []))
-        .then(data => setMessagesList(Array.isArray(data) ? data : []))
-        .catch(() => setMessagesList([]));
-    }
+    fetchLists();
   }, [activeTab, status]);
 
   // Smart auto-scroll that only scrolls to the bottom if the user is already near the bottom and auto-scroll is enabled

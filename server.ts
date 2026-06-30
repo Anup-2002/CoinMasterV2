@@ -5,6 +5,21 @@ import { execSync } from "child_process";
 // Configure Playwright to use a consistent local cache directory inside the project folder
 process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(process.cwd(), ".cache", "ms-playwright");
 
+import {
+  getSessionStateCloud,
+  saveSessionStateCloud,
+  getTrendingCoinsCloud,
+  saveTrendingCoinsCloud,
+  getGeneratedMessagesCloud,
+  saveGeneratedMessagesCloud,
+  getPostResultsCloud,
+  savePostResultsCloud,
+  getBotProgressCloud,
+  saveBotProgressCloud,
+  getSystemLogsCloud,
+  saveSystemLogsCloud
+} from "./src/firebase-db";
+
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import OpenAI from "openai";
@@ -40,6 +55,17 @@ interface LogEntry {
 }
 let logs: LogEntry[] = [];
 
+let logSyncTimeout: NodeJS.Timeout | null = null;
+function triggerLogSync() {
+  if (logSyncTimeout) return;
+  logSyncTimeout = setTimeout(() => {
+    logSyncTimeout = null;
+    saveSystemLogsCloud(logs).catch(err => {
+      console.error("[FIREBASE] Error syncing logs to cloud:", err.message);
+    });
+  }, 3000);
+}
+
 function addLog(level: "info" | "success" | "warning" | "error", message: string) {
   const timestamp = new Date().toLocaleTimeString();
   const entry: LogEntry = { timestamp, level, message };
@@ -49,6 +75,7 @@ function addLog(level: "info" | "success" | "warning" | "error", message: string
   if (logs.length > 1000) {
     logs.shift();
   }
+  triggerLogSync();
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
@@ -86,6 +113,28 @@ async function installPlaywrightChromium(): Promise<void> {
 }
 
 async function launchBrowserResilient(options: any = {}): Promise<any> {
+  // Inject highly aggressive memory-saving flags suitable for low-RAM containers like Render (512MB limit)
+  const memoryArgs = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--single-process",
+    "--no-zygote",
+    "--disable-extensions",
+    "--mute-audio",
+    '--js-flags="--max-old-space-size=128"'
+  ];
+
+  if (!options.args) {
+    options.args = [];
+  }
+  for (const arg of memoryArgs) {
+    if (!options.args.includes(arg)) {
+      options.args.push(arg);
+    }
+  }
+
   try {
     return await chromium.launch(options);
   } catch (err) {
@@ -1304,6 +1353,30 @@ function writeJsonFile<T>(filePath: string, data: T) {
   try {
     fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), "utf-8");
     fs.renameSync(tempPath, filePath);
+
+    // Synchronize to Firestore Cloud Database
+    if (filePath === AUTH_STATE_FILE) {
+      saveSessionStateCloud(JSON.stringify(data)).catch(err => {
+        console.error("[FIREBASE] Error syncing session to cloud:", err.message);
+      });
+    } else if (filePath === LAST_TRENDING_FILE) {
+      saveTrendingCoinsCloud(data as any).catch(err => {
+        console.error("[FIREBASE] Error syncing coins to cloud:", err.message);
+      });
+    } else if (filePath === GENERATED_MESSAGES_FILE) {
+      saveGeneratedMessagesCloud(data as any).catch(err => {
+        console.error("[FIREBASE] Error syncing messages to cloud:", err.message);
+      });
+    } else if (filePath === RESULTS_FILE) {
+      savePostResultsCloud(data as any).catch(err => {
+        console.error("[FIREBASE] Error syncing results to cloud:", err.message);
+      });
+    } else if (filePath === POST_PROGRESS_FILE) {
+      const progressObj = data as any;
+      saveBotProgressCloud(progressObj?.next_index || 0).catch(err => {
+        console.error("[FIREBASE] Error syncing progress to cloud:", err.message);
+      });
+    }
   } catch (error) {
     addLog("error", `Failed to write atomically to ${path.basename(filePath)}: ${(error as Error).message}`);
     if (fs.existsSync(tempPath)) {
@@ -1354,6 +1427,12 @@ app.post("/api/save-session", (req, res) => {
     JSON.parse(stateJson);
     fs.writeFileSync(AUTH_STATE_FILE, stateJson, "utf-8");
     addLog("success", "Successfully updated browser auth state (auth/state.json).");
+    
+    // Sync to Firestore Cloud Database
+    saveSessionStateCloud(stateJson).catch(err => {
+      console.error("[FIREBASE] Error saving session to cloud:", err.message);
+    });
+
     res.json({ success: true, message: "auth/state.json saved successfully." });
   } catch (error) {
     addLog("error", `Failed to save session state: ${(error as Error).message}`);
@@ -1364,6 +1443,11 @@ app.post("/api/save-session", (req, res) => {
 // 3. Clear session
 app.post("/api/clear-session", (req, res) => {
   try {
+    // Clear from Firestore Cloud Database
+    saveSessionStateCloud("").catch(err => {
+      console.error("[FIREBASE] Error clearing session from cloud:", err.message);
+    });
+
     if (fs.existsSync(AUTH_STATE_FILE)) {
       fs.unlinkSync(AUTH_STATE_FILE);
       addLog("warning", "Deleted auth/state.json session state.");
@@ -2617,7 +2701,64 @@ app.get("/api/download/overall_report.csv", (req, res) => {
 // ============================================================================
 // VITE OR STATIC FILES SERVING MIDDLEWARE
 // ============================================================================
+async function hydrateLocalFromCloud() {
+  addLog("info", "[FIREBASE] Hydrating local ephemeral storage from Firestore cloud database...");
+  try {
+    // 1. Session cookies
+    const cloudSession = await getSessionStateCloud();
+    if (cloudSession) {
+      fs.writeFileSync(AUTH_STATE_FILE, cloudSession, "utf-8");
+      addLog("success", "[FIREBASE] Hydrated login session cookies from Firestore!");
+    } else {
+      addLog("info", "[FIREBASE] No session cookies found in Firestore.");
+    }
+
+    // 2. Trending Coins
+    const cloudCoins = await getTrendingCoinsCloud();
+    if (cloudCoins && cloudCoins.length > 0) {
+      fs.writeFileSync(LAST_TRENDING_FILE, JSON.stringify(cloudCoins, null, 2), "utf-8");
+      addLog("success", `[FIREBASE] Hydrated ${cloudCoins.length} trending coins from Firestore!`);
+    }
+
+    // 3. Generated Messages
+    const cloudMessages = await getGeneratedMessagesCloud();
+    if (cloudMessages && cloudMessages.length > 0) {
+      fs.writeFileSync(GENERATED_MESSAGES_FILE, JSON.stringify(cloudMessages, null, 2), "utf-8");
+      addLog("success", `[FIREBASE] Hydrated ${cloudMessages.length} generated messages from Firestore!`);
+    }
+
+    // 4. Post Results
+    const cloudResults = await getPostResultsCloud();
+    if (cloudResults && cloudResults.length > 0) {
+      fs.writeFileSync(RESULTS_FILE, JSON.stringify(cloudResults, null, 2), "utf-8");
+      addLog("success", `[FIREBASE] Hydrated ${cloudResults.length} post results from Firestore!`);
+    }
+
+    // 5. Bot Progress
+    const cloudProgress = await getBotProgressCloud();
+    if (cloudProgress) {
+      fs.writeFileSync(POST_PROGRESS_FILE, JSON.stringify({ next_index: cloudProgress.next_index }, null, 2), "utf-8");
+      currentPostingIndex = cloudProgress.next_index;
+      addLog("success", `[FIREBASE] Hydrated bot posting progress index to ${cloudProgress.next_index} from Firestore!`);
+    }
+
+    // 6. System Logs
+    const cloudLogs = await getSystemLogsCloud();
+    if (cloudLogs && cloudLogs.length > 0) {
+      logs = cloudLogs;
+      addLog("success", `[FIREBASE] Hydrated ${cloudLogs.length} system logs from Firestore!`);
+    }
+
+    addLog("success", "[FIREBASE] Local storage state successfully synchronized with Cloud database.");
+  } catch (err) {
+    addLog("error", `[FIREBASE] Failed to hydrate local storage from Firestore: ${(err as Error).message}`);
+  }
+}
+
 async function startServer() {
+  // First, hydrate all files from Firestore cloud database
+  await hydrateLocalFromCloud();
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },

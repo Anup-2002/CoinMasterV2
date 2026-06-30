@@ -1334,7 +1334,7 @@ app.get("/api/status", (req, res) => {
     totalCoins: coins.length,
     generatedMessages: messages.length,
     postedCount: results.filter(r => r.status === "success").length,
-    failedCount: results.filter(r => r.status !== "success").length,
+    failedCount: results.filter(r => r.status !== "success" && r.status !== "skipped").length,
     results,
     progressIndex: progress.next_index,
     currentCoin: currentCoinName,
@@ -1448,9 +1448,24 @@ app.post("/api/retry-single", async (req, res) => {
   try {
     addLog("info", `Initiating manual individual retry for coin ticker ${symbol}...`);
     const messages = readJsonFile<GeneratedMessage[]>(GENERATED_MESSAGES_FILE, []);
-    const item = messages.find(m => m.symbol.toLowerCase() === symbol.toLowerCase());
+    let item = messages.find(m => m.symbol.toLowerCase() === symbol.toLowerCase());
+    
     if (!item) {
-      return res.status(404).json({ error: `No generated message found for symbol: ${symbol}` });
+      const resultsList = readJsonFile<PostResult[]>(RESULTS_FILE, []);
+      const matchedResult = resultsList.find(r => r.symbol.toLowerCase() === symbol.toLowerCase());
+      if (matchedResult) {
+        item = {
+          name: matchedResult.name,
+          symbol: matchedResult.symbol,
+          url: matchedResult.url,
+          message: matchedResult.message,
+          sentiment: matchedResult.sentiment,
+        } as any;
+      }
+    }
+
+    if (!item) {
+      return res.status(404).json({ error: `No generated message or previous result found for symbol: ${symbol}` });
     }
 
     let outcome: PostResult["status"] = "success";
@@ -2262,49 +2277,40 @@ async function runPostingLoop() {
       
       currentPostingIndex++;
       writeJsonFile(POST_PROGRESS_FILE, { next_index: currentPostingIndex });
-    } else if (outcome === "retry") {
-      addLog("info", "Executing scheduled retry attempt...");
+    } else if (outcome === "retry" || outcome === "failed") {
+      addLog("info", `Executing scheduled retry attempt for ${item.symbol} (status: ${outcome})...`);
       await new Promise(resolve => setTimeout(resolve, 5000));
       
       let retrySuccess = false;
+      let finalStatus: PostResult["status"] = "failed";
+      let finalMessage = "Retry failed";
+
       if (runMode === "Real Browser") {
         try {
           addLog("info", "Retrying post with active Playwright context...");
           const resolvedUrl = await resolveToFirstPartyUrl(item.url, item.symbol, item.name);
           const retryResult = await runRealPosting(resolvedUrl, item.message, item.sentiment || "bullish");
+          finalStatus = retryResult.status;
+          finalMessage = retryResult.message;
           if (retryResult.status === "success") {
             addLog("success", `SUCCESS: Retry posting succeeded for ${item.symbol}!`);
             retrySuccess = true;
-            consecutiveFailures = 0;
-            results.push({
-              name: item.name,
-              symbol: item.symbol,
-              url: item.url,
-              status: "success",
-              message: "Posted successfully after retry",
-              timestamp: new Date().toLocaleTimeString(),
-              sentiment: item.sentiment || "bullish",
-            });
           } else {
             addLog("error", `FAIL: Retry posting failed: ${retryResult.message}`);
-            consecutiveFailures++;
-            results.push({
-              name: item.name,
-              symbol: item.symbol,
-              url: item.url,
-              status: retryResult.status,
-              message: retryResult.message,
-              timestamp: new Date().toLocaleTimeString(),
-              sentiment: item.sentiment || "bullish",
-            });
           }
         } catch (err) {
+          finalStatus = "failed";
+          finalMessage = (err as Error).message;
           addLog("error", `Exception in retry: ${(err as Error).message}`);
-          consecutiveFailures++;
         }
       } else {
         addLog("success", `SUCCESS: Retry posting succeeded for ${item.symbol}!`);
         retrySuccess = true;
+        finalStatus = "success";
+        finalMessage = "Posted successfully after retry";
+      }
+      
+      if (retrySuccess) {
         consecutiveFailures = 0;
         results.push({
           name: item.name,
@@ -2315,11 +2321,32 @@ async function runPostingLoop() {
           timestamp: new Date().toLocaleTimeString(),
           sentiment: item.sentiment || "bullish",
         });
+      } else {
+        consecutiveFailures++;
+        results.push({
+          name: item.name,
+          symbol: item.symbol,
+          url: item.url,
+          status: finalStatus,
+          message: finalMessage,
+          timestamp: new Date().toLocaleTimeString(),
+          sentiment: item.sentiment || "bullish",
+        });
       }
       
       writeJsonFile(RESULTS_FILE, results);
       currentPostingIndex++;
       writeJsonFile(POST_PROGRESS_FILE, { next_index: currentPostingIndex });
+
+      if (consecutiveFailures >= 3) {
+        addLog("error", "CRITICAL: Automated posting paused due to 3 consecutive failures. Please verify your CoinMarketCap login session and cookies.");
+        isPostingRunning = false;
+        botStatus = "Idle";
+        break;
+      }
+      if (!retrySuccess) {
+        addLog("info", "Skipping to next coin to maintain end-to-end automation run...");
+      }
     } else {
       // Captcha, expired or failed
       consecutiveFailures++;

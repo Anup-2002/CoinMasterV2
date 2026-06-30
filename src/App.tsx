@@ -49,7 +49,7 @@ interface PostResult {
   name: string;
   symbol: string;
   url: string;
-  status: "success" | "captcha" | "expired" | "failed" | "retry";
+  status: "success" | "captcha" | "expired" | "failed" | "retry" | "skipped";
   message: string;
   timestamp: string;
 }
@@ -80,19 +80,18 @@ export default function App() {
   const [sessionDetails, setSessionDetails] = useState<any>(null);
   const [showSessionModal, setShowSessionModal] = useState<boolean>(false);
 
-  // Automated Playwright Login States
-  const [sessionModalTab, setSessionModalTab] = useState<"manual" | "automated">("manual");
-  const [loginEmail, setLoginEmail] = useState<string>("");
-  const [loginPassword, setLoginPassword] = useState<string>("");
-  const [loginStatus, setLoginStatus] = useState<string>("");
-  const [loginSessionId, setLoginSessionId] = useState<string>("");
-  const [requiresOtp, setRequiresOtp] = useState<boolean>(false);
+  // Interactive Login State
+  const [loginTab, setLoginTab] = useState<"credentials" | "cookies">("credentials");
+  const [email, setEmail] = useState<string>("");
+  const [password, setPassword] = useState<string>("");
+  const [loginStep, setLoginStep] = useState<"idle" | "authenticating" | "otp_required" | "success" | "failed">("idle");
   const [otpCode, setOtpCode] = useState<string>("");
-  const [isLoggingIn, setIsLoggingIn] = useState<boolean>(false);
+  const [loginStatusMessage, setLoginStatusMessage] = useState<string>("");
 
   // Logs state
   const [logsList, setLogsList] = useState<LogEntry[]>([]);
   const [logFilter, setLogFilter] = useState<string>("all");
+  const [logSearchQuery, setLogSearchQuery] = useState<string>("");
 
   // Data Explorer Tabs
   const [activeTab, setActiveTab] = useState<string>("coins");
@@ -108,6 +107,12 @@ export default function App() {
     full: false,
     clear: false,
   });
+
+  const isBusy =
+    status === "Fetching" ||
+    status === "Generating" ||
+    status === "Posting" ||
+    status === "Authenticating";
 
   // Browser Simulator Visual Typing State
   const [simText, setSimText] = useState("");
@@ -126,11 +131,30 @@ export default function App() {
     fetchStats();
     fetchLogs();
     fetchSessionDetails();
+    
+    // Initial fetch of lists
+    fetch("/output/last_trending.json")
+      .then(res => (res.ok ? res.json() : []))
+      .then(data => setCoinsList(Array.isArray(data) ? data : []))
+      .catch(() => {});
+    fetch("/output/generated_messages.json")
+      .then(res => (res.ok ? res.json() : []))
+      .then(data => setMessagesList(Array.isArray(data) ? data : []))
+      .catch(() => {});
 
     // Setup periodic polling for status & logs
     const interval = setInterval(() => {
       fetchStats();
       fetchLogs();
+      // Poll data lists to keep them synchronized
+      fetch("/output/last_trending.json")
+        .then(res => (res.ok ? res.json() : []))
+        .then(data => setCoinsList(Array.isArray(data) ? data : []))
+        .catch(() => {});
+      fetch("/output/generated_messages.json")
+        .then(res => (res.ok ? res.json() : []))
+        .then(data => setMessagesList(Array.isArray(data) ? data : []))
+        .catch(() => {});
     }, 2000);
 
     return () => clearInterval(interval);
@@ -192,26 +216,6 @@ export default function App() {
         const data = await res.json();
         setSessionExists(data.exists);
         setSessionDetails(data.details);
-
-        // Auto-restore session from localStorage if missing on server
-        if (!data.exists) {
-          const savedSession = localStorage.getItem("cmc_auth_state");
-          if (savedSession) {
-            console.log("Auto-restoring cookie session from local storage...");
-            await fetch("/api/save-session", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ stateJson: savedSession })
-            });
-            // Re-fetch to update state
-            const secondaryRes = await fetch("/api/get-session");
-            if (secondaryRes.ok) {
-              const secondaryData = await secondaryRes.json();
-              setSessionExists(secondaryData.exists);
-              setSessionDetails(secondaryData.details);
-            }
-          }
-        }
       }
     } catch (_) {}
   };
@@ -228,124 +232,28 @@ export default function App() {
         setGeneratedCount(data.generatedMessages);
         setPostedCount(data.postedCount);
         setFailedCount(data.failedCount);
+        setResults(data.results || []);
+        setProgressIndex(data.progressIndex);
         setCurrentCoin(data.currentCoin);
         setSessionStatus(data.sessionStatus);
         setApiStatus(data.apiStatus || { openai: false, cmc: false });
-
-        // Restore or Save Results
-        const sResults = data.results || [];
-        if (sResults.length > 0) {
-          setResults(sResults);
-          localStorage.setItem("posting_results", JSON.stringify(sResults));
-        } else {
-          const cached = localStorage.getItem("posting_results");
-          if (cached) {
-            const parsed = JSON.parse(cached);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              setResults(parsed);
-              // Restore back to server
-              fetch("/api/save-results", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ results: parsed })
-              });
-            }
-          } else {
-            setResults([]);
-          }
-        }
-
-        // Restore or Save Progress Index
-        const sProgress = data.progressIndex || 0;
-        if (sProgress > 0) {
-          setProgressIndex(sProgress);
-          localStorage.setItem("posting_progress_index", String(sProgress));
-        } else {
-          const cached = localStorage.getItem("posting_progress_index");
-          if (cached) {
-            const parsed = Number(cached);
-            if (!isNaN(parsed) && parsed > 0) {
-              setProgressIndex(parsed);
-              // Restore back to server
-              fetch("/api/save-progress", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ index: parsed })
-              });
-            }
-          } else {
-            setProgressIndex(0);
-          }
-        }
       }
     } catch (_) {}
   };
 
-  // Load Data lists on mount, status change or tab change to prevent vanishing
-  const fetchLists = async () => {
-    try {
-      // 1. Fetch trending coins from API
-      const resCoins = await fetch("/api/data/trending-coins");
-      let coins = [];
-      if (resCoins.ok) {
-        coins = await resCoins.json();
-      }
-      if (Array.isArray(coins) && coins.length > 0) {
-        setCoinsList(coins);
-        localStorage.setItem("last_trending_coins", JSON.stringify(coins));
-      } else {
-        // If server returned empty, check browser local storage cache
-        const cached = localStorage.getItem("last_trending_coins");
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            setCoinsList(parsed);
-            // Restore back to server
-            fetch("/api/save-trending-coins", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ coins: parsed })
-            });
-          }
-        } else {
-          setCoinsList([]);
-        }
-      }
-
-      // 2. Fetch generated messages from API
-      const resMsg = await fetch("/api/data/generated-messages");
-      let messages = [];
-      if (resMsg.ok) {
-        messages = await resMsg.json();
-      }
-      if (Array.isArray(messages) && messages.length > 0) {
-        setMessagesList(messages);
-        localStorage.setItem("generated_comments", JSON.stringify(messages));
-      } else {
-        // If server returned empty, check browser local storage cache
-        const cached = localStorage.getItem("generated_comments");
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            setMessagesList(parsed);
-            // Restore back to server
-            fetch("/api/save-generated-messages", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ messages: parsed })
-            });
-          }
-        } else {
-          setMessagesList([]);
-        }
-      }
-    } catch (err) {
-      console.error("Error fetching or restoring lists:", err);
-    }
-  };
-
+  // Lazy Load Data lists based on Active Tab
   useEffect(() => {
-    fetchLists();
+    if (activeTab === "coins") {
+      fetch("/output/last_trending.json")
+        .then(res => (res.ok ? res.json() : []))
+        .then(data => setCoinsList(Array.isArray(data) ? data : []))
+        .catch(() => setCoinsList([]));
+    } else if (activeTab === "comments" || activeTab === "reports") {
+      fetch("/output/generated_messages.json")
+        .then(res => (res.ok ? res.json() : []))
+        .then(data => setMessagesList(Array.isArray(data) ? data : []))
+        .catch(() => setMessagesList([]));
+    }
   }, [activeTab, status]);
 
   // Smart auto-scroll that only scrolls to the bottom if the user is already near the bottom and auto-scroll is enabled
@@ -371,19 +279,6 @@ export default function App() {
   const runCommand = async (endpoint: string, pendingKey: keyof typeof isPending) => {
     setIsPending(prev => ({ ...prev, [pendingKey]: true }));
     try {
-      if (endpoint.includes("clear-session")) {
-        localStorage.removeItem("cmc_auth_state");
-      }
-      if (endpoint.includes("clear-all")) {
-        localStorage.removeItem("last_trending_coins");
-        localStorage.removeItem("generated_comments");
-        localStorage.removeItem("posting_results");
-        localStorage.removeItem("posting_progress_index");
-        setCoinsList([]);
-        setMessagesList([]);
-        setResults([]);
-        setProgressIndex(0);
-      }
       const res = await fetch(endpoint, { method: "POST" });
       const data = await res.json();
       fetchStats();
@@ -409,7 +304,6 @@ export default function App() {
         body: JSON.stringify({ stateJson: sessionJson })
       });
       if (res.ok) {
-        localStorage.setItem("cmc_auth_state", sessionJson);
         setSessionJson("");
         setShowSessionModal(false);
         fetchSessionDetails();
@@ -425,97 +319,121 @@ export default function App() {
     }
   };
 
-  // Automated Playwright login handlers
-  const handleInitiateLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!loginEmail.trim() || !loginPassword.trim()) {
-      setLoginStatus("Email and password are required.");
+  // Start credential-based login
+  const handleStartLogin = async () => {
+    if (!email.trim() || !password.trim()) {
+      alert("Please fill in both email and password.");
       return;
     }
-    setIsLoggingIn(true);
-    setLoginStatus("Launching browser on backend and logging in... (may take 10-20s)");
-    setRequiresOtp(false);
-    setLoginSessionId("");
-    
+    setLoginStep("authenticating");
+    setLoginStatusMessage("Initializing secure browser, navigating to CoinMarketCap and entering credentials...");
     try {
-      const res = await fetch("/api/login/initiate", {
+      const res = await fetch("/api/start-login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: loginEmail, password: loginPassword })
+        body: JSON.stringify({ email, password })
       });
       const data = await res.json();
       if (!res.ok) {
-        setLoginStatus(data.error || "Failed to initiate login.");
+        setLoginStep("failed");
+        setLoginStatusMessage(data.error || "Login attempt failed.");
         return;
       }
 
       if (data.status === "success") {
-        setLoginStatus("Success! Logged in and saved session.");
+        setLoginStep("success");
+        setLoginStatusMessage("Successfully authenticated! Your state.json is now active.");
         fetchSessionDetails();
         fetchStats();
-        setTimeout(() => {
-          setShowSessionModal(false);
-          // Reset states
-          setLoginEmail("");
-          setLoginPassword("");
-          setLoginStatus("");
-        }, 2000);
-      } else if (data.status === "otp_required") {
-        setLoginStatus(data.message);
-        setLoginSessionId(data.loginSessionId);
-        setRequiresOtp(true);
+      } else if (data.status === "requires_otp") {
+        setLoginStep("otp_required");
+        setLoginStatusMessage(data.message || "Enter the 6-digit verification code sent to your email.");
       } else {
-        setLoginStatus(data.message || "Failed to log in automatically.");
+        setLoginStep("failed");
+        setLoginStatusMessage(data.message || "Authentication attempt was unsuccessful.");
       }
-    } catch (error) {
-      setLoginStatus("Error initiating login: " + (error as Error).message);
-    } finally {
-      setIsLoggingIn(false);
+    } catch (err) {
+      setLoginStep("failed");
+      setLoginStatusMessage("Error connecting to login service: " + (err as Error).message);
     }
   };
 
-  const handleSubmitOtp = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!otpCode.trim()) {
-      setLoginStatus("Please enter the verification code.");
+  // Submit OTP / Verification code
+  const handleSubmitOtp = async () => {
+    if (!otpCode.trim() || otpCode.length < 4) {
+      alert("Please enter a valid verification code.");
       return;
     }
-    setIsLoggingIn(true);
-    setLoginStatus("Verifying OTP code and finalising login session...");
-
+    setLoginStep("authenticating");
+    setLoginStatusMessage("Submitting 6-digit code and verifying active session, please wait...");
     try {
-      const res = await fetch("/api/login/submit-otp", {
+      const res = await fetch("/api/submit-otp", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ loginSessionId, otp: otpCode })
+        body: JSON.stringify({ otp: otpCode })
       });
       const data = await res.json();
       if (!res.ok) {
-        setLoginStatus(data.error || "Failed to verify OTP.");
+        setLoginStep("failed");
+        setLoginStatusMessage(data.error || "OTP verification failed.");
         return;
       }
 
       if (data.status === "success") {
-        setLoginStatus("Success! Logged in and saved session.");
+        setLoginStep("success");
+        setLoginStatusMessage("Success! Your CoinMarketCap session is fully verified and saved to state.json.");
+        setOtpCode("");
         fetchSessionDetails();
         fetchStats();
-        setTimeout(() => {
-          setShowSessionModal(false);
-          // Reset states
-          setLoginEmail("");
-          setLoginPassword("");
-          setLoginStatus("");
-          setRequiresOtp(false);
-          setOtpCode("");
-          setLoginSessionId("");
-        }, 2000);
       } else {
-        setLoginStatus(data.message || "Verification failed.");
+        setLoginStep("failed");
+        setLoginStatusMessage(data.message || "Failed to verify security code.");
       }
-    } catch (error) {
-      setLoginStatus("Error submitting OTP: " + (error as Error).message);
+    } catch (err) {
+      setLoginStep("failed");
+      setLoginStatusMessage("Error submitting verification code: " + (err as Error).message);
+    }
+  };
+
+  // Cancel login sequence
+  const handleCancelLogin = async () => {
+    try {
+      await fetch("/api/cancel-login", { method: "POST" });
+    } catch (_) {}
+    setLoginStep("idle");
+    setLoginStatusMessage("");
+    setOtpCode("");
+  };
+
+  const handleResetLoginState = () => {
+    setLoginStep("idle");
+    setLoginStatusMessage("");
+    setOtpCode("");
+  };
+
+  // State for tracking manual retry indicators
+  const [individualLoading, setIndividualLoading] = useState<Record<string, "retry" | null>>({});
+
+  // Individual Coin manual actions
+  const handleRetrySingle = async (symbol: string) => {
+    setIndividualLoading(prev => ({ ...prev, [symbol]: "retry" }));
+    try {
+      const res = await fetch("/api/retry-single", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        fetchStats();
+        fetchLogs();
+      } else {
+        alert(data.error || "Manual retry failed.");
+      }
+    } catch (err) {
+      alert("Network error: " + (err as Error).message);
     } finally {
-      setIsLoggingIn(false);
+      setIndividualLoading(prev => ({ ...prev, [symbol]: null }));
     }
   };
 
@@ -536,46 +454,11 @@ export default function App() {
     }
   };
 
-  // Skip current coin in progress
-  const handleSkipCoin = async () => {
-    try {
-      const res = await fetch("/api/skip-coin", { method: "POST" });
-      if (res.ok) {
-        const data = await res.json();
-        // Clear cached local storage index to ensure sync
-        localStorage.setItem("posting_progress_index", String(data.nextIndex));
-        setProgressIndex(data.nextIndex);
-        fetchStats();
-      } else {
-        const err = await res.json();
-        alert(err.error || "Failed to skip coin.");
-      }
-    } catch (error) {
-      console.error("Error skipping coin:", error);
-    }
-  };
-
-  // Reset entire posting progress back to 0
-  const handleResetProgress = async () => {
-    if (!confirm("Are you sure you want to reset the posting progress back to the first coin?")) {
-      return;
-    }
-    try {
-      const res = await fetch("/api/reset-progress", { method: "POST" });
-      if (res.ok) {
-        localStorage.setItem("posting_progress_index", "0");
-        setProgressIndex(0);
-        fetchStats();
-      }
-    } catch (error) {
-      console.error("Error resetting progress:", error);
-    }
-  };
-
   // Log filter Logic
   const filteredLogs = logsList.filter(l => {
-    if (logFilter === "all") return true;
-    return l.level === logFilter;
+    const matchesLevel = logFilter === "all" || l.level === logFilter;
+    const matchesQuery = !logSearchQuery.trim() || l.message.toLowerCase().includes(logSearchQuery.toLowerCase());
+    return matchesLevel && matchesQuery;
   });
 
   return (
@@ -679,7 +562,7 @@ export default function App() {
               <div className="space-y-3.5">
                 <button
                   onClick={() => runCommand("/api/check-login", "login")}
-                  disabled={isPending.login || status === "Posting"}
+                  disabled={isPending.login || isBusy}
                   className="w-full text-left p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 transition flex items-center justify-between group disabled:opacity-50"
                   id="btn-login"
                 >
@@ -701,7 +584,7 @@ export default function App() {
 
                 <button
                   onClick={() => runCommand("/api/fetch-trending", "fetch")}
-                  disabled={isPending.fetch || status === "Posting"}
+                  disabled={isPending.fetch || isBusy}
                   className="w-full text-left p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 transition flex items-center justify-between group disabled:opacity-50"
                   id="btn-fetch"
                 >
@@ -723,7 +606,7 @@ export default function App() {
 
                 <button
                   onClick={() => runCommand("/api/generate-messages", "generate")}
-                  disabled={isPending.generate || status === "Posting" || totalCoins === 0}
+                  disabled={isPending.generate || isBusy || totalCoins === 0}
                   className="w-full text-left p-3 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 transition flex items-center justify-between group disabled:opacity-50"
                   id="btn-generate"
                 >
@@ -746,7 +629,7 @@ export default function App() {
                 {status === "Posting" ? (
                   <button
                     onClick={() => runCommand("/api/stop-posting", "post")}
-                    className="w-full p-3.5 rounded-xl bg-red-600/10 hover:bg-red-600/20 border border-red-500/20 text-red-400 hover:text-red-300 transition flex items-center justify-center gap-2.5 font-semibold text-sm cursor-pointer"
+                    className="w-full p-3.5 rounded-xl bg-red-600/10 hover:bg-red-600/20 border border-red-500/20 text-red-400 hover:text-red-300 transition flex items-center justify-center gap-2.5 font-semibold text-sm cursor-pointer animate-pulse"
                     id="btn-pause"
                   >
                     <Pause className="h-4.5 w-4.5" /> Pause posting sequence
@@ -754,7 +637,7 @@ export default function App() {
                 ) : (
                   <button
                     onClick={() => runCommand("/api/post-chat", "post")}
-                    disabled={isPending.post || generatedCount === 0}
+                    disabled={isPending.post || isBusy || generatedCount === 0}
                     className="w-full p-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition flex items-center justify-center gap-2.5 font-bold text-sm cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                     id="btn-start"
                   >
@@ -768,7 +651,7 @@ export default function App() {
             <div className="mt-6 pt-5 border-t border-slate-800 flex flex-col gap-3">
               <button
                 onClick={() => runCommand("/api/full-flow", "full")}
-                disabled={isPending.full || status === "Posting"}
+                disabled={isPending.full || isBusy}
                 className="w-full p-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 transition flex items-center justify-center gap-2 font-extrabold text-sm shadow-lg shadow-emerald-500/10 disabled:opacity-50 cursor-pointer"
                 id="btn-full-flow"
               >
@@ -783,8 +666,8 @@ export default function App() {
                 <span>Runs fetch, generate & post in a row</span>
                 <button
                   onClick={() => runCommand("/api/clear-all", "clear")}
-                  disabled={isPending.clear || status === "Posting"}
-                  className="text-red-400 hover:text-red-300 transition-all duration-200 active:scale-95 flex items-center gap-1 font-semibold"
+                  disabled={isPending.clear || isBusy}
+                  className="text-red-400 hover:text-red-300 transition-all duration-200 active:scale-95 flex items-center gap-1 font-semibold disabled:opacity-55"
                   id="btn-clear-stats"
                 >
                   <Trash2 className="h-3 w-3" /> Reset Storage
@@ -839,7 +722,8 @@ export default function App() {
                 <div className="space-y-2">
                   <button
                     onClick={() => setShowSessionModal(true)}
-                    className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-100 hover:text-white transition flex items-center justify-center gap-2 font-semibold text-xs cursor-pointer"
+                    disabled={isBusy}
+                    className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-100 hover:text-white transition flex items-center justify-center gap-2 font-semibold text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <Upload className="h-3.5 w-3.5" /> Configure Cookie Session
                   </button>
@@ -847,7 +731,8 @@ export default function App() {
                   {sessionExists && (
                     <button
                       onClick={() => runCommand("/api/clear-session", "login")}
-                      className="w-full py-2 px-4 rounded-xl bg-red-600/10 hover:bg-red-600/20 text-red-400 border border-red-500/10 transition flex items-center justify-center gap-2 font-medium text-[11px] cursor-pointer"
+                      disabled={isBusy}
+                      className="w-full py-2 px-4 rounded-xl bg-red-600/10 hover:bg-red-600/20 text-red-400 border border-red-500/10 transition flex items-center justify-center gap-2 font-medium text-[11px] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Delete auth/state.json
                     </button>
@@ -906,42 +791,16 @@ export default function App() {
               </div>
             </div>
 
-            <div className="pt-4 border-t border-slate-800 space-y-4">
-              <div className="space-y-2">
-                <div className="flex justify-between text-xs font-mono">
-                  <span className="text-slate-400">Batch progress:</span>
-                  <span className="text-emerald-400 font-bold">{totalCoins > 0 ? Math.round((progressIndex / totalCoins) * 100) : 0}%</span>
-                </div>
-                <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-850">
-                  <div
-                    className="bg-gradient-to-r from-emerald-500 to-teal-500 h-full transition-all duration-500"
-                    style={{ width: `${totalCoins > 0 ? (progressIndex / totalCoins) * 100 : 0}%` }}
-                  ></div>
-                </div>
+            <div className="pt-4 border-t border-slate-800 space-y-2">
+              <div className="flex justify-between text-xs font-mono">
+                <span className="text-slate-400">Batch progress:</span>
+                <span className="text-emerald-400 font-bold">{totalCoins > 0 ? Math.round((progressIndex / totalCoins) * 100) : 0}%</span>
               </div>
-
-              {/* Bot Control Actions for Handling Captchas / Blocks */}
-              <div className="grid grid-cols-2 gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={handleSkipCoin}
-                  disabled={status === "Posting" || progressIndex >= totalCoins}
-                  className="py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-100 hover:text-white transition flex items-center justify-center gap-1.5 font-bold text-[11px] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                  title="Skip the current coin if it triggers a captcha or rate limit block"
-                >
-                  <ChevronRight className="h-3.5 w-3.5 text-amber-400" />
-                  Skip Coin
-                </button>
-                <button
-                  type="button"
-                  onClick={handleResetProgress}
-                  disabled={status === "Posting" || progressIndex === 0}
-                  className="py-2 px-3 rounded-xl bg-red-950/20 hover:bg-red-950/40 text-red-400 border border-red-900/30 hover:border-red-900/50 transition flex items-center justify-center gap-1.5 font-bold text-[11px] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                  title="Reset the posting progress index to 0 (first coin)"
-                >
-                  <RefreshCw className="h-3 w-3" />
-                  Reset progress
-                </button>
+              <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-850">
+                <div
+                  className="bg-gradient-to-r from-emerald-500 to-teal-500 h-full transition-all duration-500"
+                  style={{ width: `${totalCoins > 0 ? (progressIndex / totalCoins) * 100 : 0}%` }}
+                ></div>
               </div>
             </div>
           </section>
@@ -991,15 +850,33 @@ export default function App() {
 
           {/* LOG CONSOLE TERMINAL (5 cols) */}
           <section className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col justify-between">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="font-bold text-white tracking-tight flex items-center gap-2">
-                <span className="p-1.5 bg-slate-800 text-emerald-400 rounded-lg border border-slate-700">
-                  <TerminalIcon className="h-4 w-4" />
-                </span>
-                Interactive Logs Console
-              </h2>
+            <div className="flex flex-col gap-3.5 mb-3.5 border-b border-slate-850 pb-3">
+              <div className="flex items-center justify-between">
+                <h2 className="font-bold text-white tracking-tight flex items-center gap-2">
+                  <span className="p-1.5 bg-slate-800 text-emerald-400 rounded-lg border border-slate-700">
+                    <TerminalIcon className="h-4 w-4" />
+                  </span>
+                  Interactive Logs Console
+                </h2>
+                <button
+                  onClick={() => runCommand("/api/clear-all", "clear")}
+                  className="p-1 text-slate-500 hover:text-red-400 rounded hover:bg-slate-800 transition"
+                  title="Clear console"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
               
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Search query input */}
+                <input
+                  type="text"
+                  placeholder="Filter logs by keyword..."
+                  value={logSearchQuery}
+                  onChange={(e) => setLogSearchQuery(e.target.value)}
+                  className="flex-1 bg-slate-950 border border-slate-800 rounded px-2.5 py-1 text-[11px] text-slate-300 focus:outline-none focus:border-emerald-500 placeholder-slate-600 font-mono"
+                />
+
                 {/* Auto-scroll toggle indicator/button */}
                 <button
                   onClick={() => {
@@ -1032,20 +909,13 @@ export default function App() {
                   <option value="warning">WARNING</option>
                   <option value="error">ERROR</option>
                 </select>
-                <button
-                  onClick={() => runCommand("/api/clear-all", "clear")}
-                  className="p-1 text-slate-500 hover:text-red-400 rounded hover:bg-slate-800 transition"
-                  title="Clear console"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
               </div>
             </div>
 
             {/* Terminal console */}
             <div 
               ref={terminalContainerRef}
-              className="bg-slate-950 rounded-xl border border-slate-850 p-4 h-[180px] overflow-y-auto font-mono text-[11px] space-y-1.5 leading-relaxed shadow-inner"
+              className="bg-slate-950 rounded-xl border border-slate-850 p-4 h-[360px] overflow-y-auto font-mono text-[11px] space-y-1.5 leading-relaxed shadow-inner"
             >
               {filteredLogs.length === 0 ? (
                 <div className="text-slate-600 italic text-center pt-12">No console messages matching filter.</div>
@@ -1198,50 +1068,170 @@ export default function App() {
             )}
 
             {/* TAB 2: GENERATED COMMENTS */}
-            {activeTab === "comments" && (
-              <div className="overflow-x-auto rounded-xl border border-slate-850">
-                <table className="w-full text-left text-xs border-collapse">
-                  <thead className="bg-slate-950 text-slate-400 uppercase text-[10px] tracking-widest border-b border-slate-850 font-mono">
-                    <tr>
-                      <th className="py-3 px-4 w-[150px]">Asset</th>
-                      <th className="py-3 px-4">Generated Comment Message ({messagesList.length})</th>
-                      <th className="py-3 px-4 text-right w-[180px]">Automated Action Link</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-850/60 bg-slate-900/40">
-                    {messagesList.length === 0 ? (
-                      <tr>
-                        <td colSpan={3} className="py-8 text-center text-slate-500 italic">
-                          No generated comments found. Trigger "Generate Comments" or "Full automated cycle" above!
-                        </td>
-                      </tr>
-                    ) : (
-                      messagesList.map((item, index) => (
-                        <tr key={index} className="hover:bg-slate-800/20 transition-all">
-                          <td className="py-4 px-4 font-bold text-white">
-                            <div className="leading-none">{item.name}</div>
-                            <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">{item.symbol}</span>
-                          </td>
-                          <td className="py-4 px-4 font-mono text-slate-300 leading-relaxed max-w-2xl italic">
-                            "{item.message}"
-                          </td>
-                          <td className="py-4 px-4 text-right">
-                            <a
-                              href={item.url}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="text-purple-400 hover:text-purple-300 hover:underline inline-flex items-center gap-1 font-semibold"
-                            >
-                              Post Manually <ChevronRight className="h-3 w-3" />
-                            </a>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            )}
+            {activeTab === "comments" && (() => {
+              const pendingCoins = messagesList.filter(msgItem => !results.some(r => r.symbol.toLowerCase() === msgItem.symbol.toLowerCase()));
+              const failedCoins = messagesList.filter(msgItem => results.some(r => r.symbol.toLowerCase() === msgItem.symbol.toLowerCase() && r.status !== "success"));
+              return (
+                <div className="space-y-8">
+                  {/* Active Automated Posting Queue */}
+                  <div className="space-y-3">
+                    <h3 className="text-sm font-bold text-white tracking-tight flex items-center gap-2">
+                      <span className="w-2 h-2 rounded-full bg-blue-500"></span>
+                      Active Automated Posting Queue ({pendingCoins.length} coins pending)
+                    </h3>
+                    <div className="overflow-x-auto rounded-xl border border-slate-850">
+                      <table className="w-full text-left text-xs border-collapse">
+                        <thead className="bg-slate-950 text-slate-400 uppercase text-[10px] tracking-widest border-b border-slate-850 font-mono">
+                          <tr>
+                            <th className="py-3 px-4 w-[100px]">Sequence</th>
+                            <th className="py-3 px-4 w-[150px]">Asset</th>
+                            <th className="py-3 px-4 w-[120px]">Sentiment</th>
+                            <th className="py-3 px-4">Comment Message</th>
+                            <th className="py-3 px-4 text-right w-[150px]">Link</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-850/60 bg-slate-900/40">
+                          {pendingCoins.length === 0 ? (
+                            <tr>
+                              <td colSpan={5} className="py-6 text-center text-slate-500 italic">
+                                No pending coins in queue. All coins have been processed!
+                              </td>
+                            </tr>
+                          ) : (
+                            pendingCoins.map((item, index) => (
+                              <tr key={index} className="hover:bg-slate-800/20 transition-all">
+                                <td className="py-4 px-4 font-mono">
+                                  <span className="text-[10px] text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded border border-blue-500/20 font-bold">
+                                    Seq #{index + 1}
+                                  </span>
+                                </td>
+                                <td className="py-4 px-4 font-bold text-white">
+                                  <div className="leading-none">{item.name}</div>
+                                  <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">{item.symbol}</span>
+                                </td>
+                                <td className="py-4 px-4">
+                                  {item.sentiment === "bearish" ? (
+                                    <span className="px-2 py-0.5 rounded text-[10px] bg-rose-500/10 text-rose-400 border border-rose-500/20 uppercase tracking-wider font-bold">
+                                      Bearish
+                                    </span>
+                                  ) : (
+                                    <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 uppercase tracking-wider font-bold">
+                                      Bullish
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-4 px-4 font-mono text-slate-300 leading-relaxed italic">
+                                  "{item.message}"
+                                </td>
+                                <td className="py-4 px-4 text-right">
+                                  <a
+                                    href={item.url}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="text-blue-400 hover:text-blue-300 hover:underline inline-flex items-center gap-1 font-semibold"
+                                  >
+                                    Open <ChevronRight className="h-3 w-3" />
+                                  </a>
+                                </td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* Failed/Unsuccessful Submissions */}
+                  <div className="space-y-3 pt-4 border-t border-slate-850">
+                    <h3 className="text-sm font-bold text-white tracking-tight flex items-center gap-2">
+                      <span className="w-2 h-2 rounded-full bg-rose-500"></span>
+                      Failed / Unsuccessful Submissions ({failedCoins.length} failures)
+                    </h3>
+                    <div className="overflow-x-auto rounded-xl border border-slate-850">
+                      <table className="w-full text-left text-xs border-collapse">
+                        <thead className="bg-slate-950 text-slate-400 uppercase text-[10px] tracking-widest border-b border-slate-850 font-mono">
+                          <tr>
+                            <th className="py-3 px-4 w-[150px]">Asset</th>
+                            <th className="py-3 px-4 w-[120px]">Sentiment</th>
+                            <th className="py-3 px-4">Error/Status Details</th>
+                            <th className="py-3 px-4 text-center w-[150px]">Manual Retry Action</th>
+                            <th className="py-3 px-4 text-right w-[150px]">Link</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-850/60 bg-slate-900/40">
+                          {failedCoins.length === 0 ? (
+                            <tr>
+                              <td colSpan={5} className="py-6 text-center text-slate-500 italic">
+                                No unsuccessful submissions found. Smooth sailing!
+                              </td>
+                            </tr>
+                          ) : (
+                            failedCoins.map((item, index) => {
+                              const resEntry = results.find(r => r.symbol.toLowerCase() === item.symbol.toLowerCase());
+                              return (
+                                <tr key={index} className="hover:bg-slate-800/20 transition-all bg-rose-500/[0.02]">
+                                  <td className="py-4 px-4 font-bold text-white">
+                                    <div className="leading-none">{item.name}</div>
+                                    <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">{item.symbol}</span>
+                                  </td>
+                                  <td className="py-4 px-4">
+                                    {item.sentiment === "bearish" ? (
+                                      <span className="px-2 py-0.5 rounded text-[10px] bg-rose-500/10 text-rose-400 border border-rose-500/20 uppercase tracking-wider font-bold">
+                                        Bearish
+                                      </span>
+                                    ) : (
+                                      <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 uppercase tracking-wider font-bold">
+                                        Bullish
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="py-4 px-4 text-slate-300 font-mono text-[11px]">
+                                    <div className="text-rose-400 font-bold mb-1 flex items-center gap-1.5">
+                                      <AlertTriangle className="h-3.5 w-3.5" />
+                                      {resEntry ? resEntry.status.toUpperCase() : "FAILED"}
+                                    </div>
+                                    <div className="text-slate-400 italic">
+                                      {resEntry ? resEntry.message : "Submission failed"}
+                                    </div>
+                                  </td>
+                                  <td className="py-4 px-4 text-center">
+                                    <div className="flex items-center justify-center">
+                                      <button
+                                        onClick={() => handleRetrySingle(item.symbol)}
+                                        disabled={individualLoading[item.symbol] !== null || isBusy}
+                                        className="px-3 py-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500 text-emerald-400 hover:text-slate-950 font-bold font-mono text-[10px] tracking-wide border border-emerald-500/25 transition flex items-center gap-1.5 disabled:opacity-50 disabled:hover:bg-emerald-500/10 disabled:hover:text-emerald-400 cursor-pointer"
+                                        title="Click to process and post this specific coin alone. Pause automated posting first."
+                                      >
+                                        {individualLoading[item.symbol] === "retry" ? (
+                                          <RefreshCw className="h-3 w-3 animate-spin" />
+                                        ) : (
+                                          <Play className="h-3 w-3 fill-current" />
+                                        )}
+                                        Post / Retry
+                                      </button>
+                                    </div>
+                                  </td>
+                                  <td className="py-4 px-4 text-right">
+                                    <a
+                                      href={item.url}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="text-rose-400 hover:text-rose-300 hover:underline inline-flex items-center gap-1 font-semibold"
+                                    >
+                                      Open <ChevronRight className="h-3 w-3" />
+                                    </a>
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* TAB 3: SUBMISSION RESULTS */}
             {activeTab === "results" && (
@@ -1253,63 +1243,110 @@ export default function App() {
                       <th className="py-3 px-4">Asset</th>
                       <th className="py-3 px-4">Sentiment</th>
                       <th className="py-3 px-4">Log Status</th>
-                      <th className="py-3 px-4">Bypass Details</th>
+                      <th className="py-3 px-4">Execution Message / Details</th>
+                      <th className="py-3 px-4 text-center">Interactive Controls</th>
                       <th className="py-3 px-4 text-right">Target Link</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-850/60 bg-slate-900/40">
-                    {results.length === 0 ? (
+                    {messagesList.length === 0 ? (
                       <tr>
-                        <td colSpan={6} className="py-8 text-center text-slate-500 italic">
-                          No post executions logged in results.json. Run "Start posting sequence" to execute comments!
+                        <td colSpan={7} className="py-8 text-center text-slate-500 italic">
+                          No generated comments found. Trigger "Generate Comments" or "Full automated cycle" above!
                         </td>
                       </tr>
-                    ) : (
-                      results.map((item, index) => (
-                        <tr key={index} className="hover:bg-slate-800/20 transition-all">
-                          <td className="py-3.5 px-4 font-mono text-slate-500">
-                            {item.timestamp || "N/A"}
-                          </td>
-                          <td className="py-3.5 px-4">
-                            <div className="font-bold text-white leading-none">{item.name}</div>
-                            <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">{item.symbol}</span>
-                          </td>
-                          <td className="py-3.5 px-4 font-bold">
-                            <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 uppercase tracking-wider">
-                              Bullish
-                            </span>
-                          </td>
-                          <td className="py-3.5 px-4 font-semibold">
-                            {item.status === "success" ? (
-                              <span className="text-emerald-400 flex items-center gap-1">
-                                <CheckCircle className="h-3.5 w-3.5" /> Post Submitted
-                              </span>
-                            ) : item.status === "captcha" ? (
-                              <span className="text-amber-400 flex items-center gap-1 font-bold">
-                                <AlertTriangle className="h-3.5 w-3.5 animate-bounce" /> Captcha Detected
-                              </span>
-                            ) : (
-                              <span className="text-red-400 flex items-center gap-1 font-bold">
-                                <AlertTriangle className="h-3.5 w-3.5" /> {item.status.toUpperCase()}
-                              </span>
-                            )}
-                          </td>
-                          <td className="py-3.5 px-4 text-slate-300 font-mono text-[11px]">
-                            {item.message}
-                          </td>
-                          <td className="py-3.5 px-4 text-right">
-                            <a
-                              href={item.url}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="text-blue-400 hover:text-blue-300 hover:underline inline-flex items-center gap-1 font-semibold"
-                            >
-                              Verify URL <ChevronRight className="h-3 w-3" />
-                            </a>
-                          </td>
-                        </tr>
-                      ))
-                    )}
+                    ) : (() => {
+                      const pendingItems = messagesList.filter(msgItem => !results.some(r => r.symbol.toLowerCase() === msgItem.symbol.toLowerCase()));
+                      return messagesList.map((msgItem, index) => {
+                        const item = results.find(r => r.symbol.toLowerCase() === msgItem.symbol.toLowerCase());
+                        const pendingIndex = pendingItems.findIndex(p => p.symbol.toLowerCase() === msgItem.symbol.toLowerCase());
+                        const seqStr = pendingIndex !== -1 ? `Seq #${pendingIndex + 1}` : "";
+                        
+                        return (
+                          <tr key={index} className="hover:bg-slate-800/20 transition-all">
+                            <td className="py-3.5 px-4 font-mono text-slate-500">
+                              {item ? (item.timestamp || "N/A") : "Pending"}
+                            </td>
+                            <td className="py-3.5 px-4">
+                              <div className="font-bold text-white leading-none">{msgItem.name}</div>
+                              <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">{msgItem.symbol}</span>
+                            </td>
+                            <td className="py-3.5 px-4 font-bold">
+                              {(item?.sentiment || msgItem.sentiment || "bullish") === "bearish" ? (
+                                <span className="px-2 py-0.5 rounded text-[10px] bg-rose-500/10 text-rose-400 border border-rose-500/20 uppercase tracking-wider">
+                                  Bearish
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 uppercase tracking-wider">
+                                  Bullish
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3.5 px-4 font-semibold">
+                              {!item ? (
+                                <span className="text-slate-400 flex items-center gap-1.5 font-medium font-mono">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-slate-500 animate-pulse"></span>
+                                  In Queue {seqStr && <span className="text-[10px] text-slate-500 bg-slate-800/80 px-1.5 py-0.5 rounded border border-slate-750 font-bold ml-1">{seqStr}</span>}
+                                </span>
+                              ) : item.status === "skipped" ? (
+                                <span className="text-slate-400 flex items-center gap-1 font-bold">
+                                  <AlertTriangle className="h-3.5 w-3.5" /> Skipped (DEX)
+                                </span>
+                              ) : item.status === "success" ? (
+                                <span className="text-emerald-400 flex items-center gap-1 font-bold">
+                                  <CheckCircle className="h-3.5 w-3.5" /> Post Submitted
+                                </span>
+                              ) : item.status === "captcha" ? (
+                                <span className="text-amber-400 flex items-center gap-1 font-bold">
+                                  <AlertTriangle className="h-3.5 w-3.5 animate-bounce" /> Captcha Detected
+                                </span>
+                              ) : (
+                                <span className="text-red-400 flex items-center gap-1 font-bold">
+                                  <AlertTriangle className="h-3.5 w-3.5" /> {item.status.toUpperCase()}
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3.5 px-4 text-slate-300 font-mono text-[11px] max-w-xs truncate" title={item ? item.message : msgItem.message}>
+                              {item ? item.message : `Generated: "${msgItem.message.substring(0, 40)}..."`}
+                            </td>
+                            
+                             {/* Manual post retry controls */}
+                            <td className="py-3.5 px-4 text-center">
+                              {item && item.status !== "success" ? (
+                                <div className="flex items-center justify-center">
+                                  <button
+                                    onClick={() => handleRetrySingle(msgItem.symbol)}
+                                    disabled={individualLoading[msgItem.symbol] !== null || isBusy}
+                                    className="px-2.5 py-1 rounded-lg bg-emerald-500/10 hover:bg-emerald-500 text-emerald-400 hover:text-slate-950 font-bold font-mono text-[10px] tracking-wide border border-emerald-500/25 transition flex items-center gap-1 disabled:opacity-50 disabled:hover:bg-emerald-500/10 disabled:hover:text-emerald-400 cursor-pointer"
+                                    title="Manually trigger post execution for this coin alone"
+                                  >
+                                    {individualLoading[msgItem.symbol] === "retry" ? (
+                                      <RefreshCw className="h-2.5 w-2.5 animate-spin" />
+                                    ) : (
+                                      <Play className="h-2.5 w-2.5 fill-current" />
+                                    )}
+                                    Post/Retry
+                                  </button>
+                                </div>
+                              ) : (
+                                <span className="text-slate-600 font-mono text-[11px]">—</span>
+                              )}
+                            </td>
+
+                            <td className="py-3.5 px-4 text-right">
+                              <a
+                                href={msgItem.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="text-blue-400 hover:text-blue-300 hover:underline inline-flex items-center gap-1 font-semibold"
+                              >
+                                Verify <ChevronRight className="h-3 w-3" />
+                              </a>
+                            </td>
+                          </tr>
+                        );
+                      });
+                    })()}
                   </tbody>
                 </table>
               </div>
@@ -1317,80 +1354,210 @@ export default function App() {
 
             {/* TAB 4: CSV EXPORTS & REPORTS */}
             {activeTab === "reports" && (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-                
-                <div className="p-5 bg-slate-950 rounded-2xl border border-slate-800 flex flex-col justify-between hover:border-slate-700 transition">
-                  <div className="space-y-2">
-                    <div className="p-2.5 bg-blue-500/10 text-blue-400 rounded-xl border border-blue-500/20 w-fit">
-                      <FileText className="h-5 w-5" />
+              <div className="space-y-8">
+                {/* 4.1. CSV Exporters Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                  
+                  <div className="p-5 bg-slate-950 rounded-2xl border border-slate-800 flex flex-col justify-between hover:border-slate-700 transition">
+                    <div className="space-y-2">
+                      <div className="p-2.5 bg-blue-500/10 text-blue-400 rounded-xl border border-blue-500/20 w-fit">
+                        <FileText className="h-5 w-5" />
+                      </div>
+                      <h3 className="font-bold text-white text-sm">Trending Coins CSV</h3>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Complete log report containing details of the top trending assets, dynamic live price changes, ranks, and coin URLs.
+                      </p>
                     </div>
-                    <h3 className="font-bold text-white text-sm">Trending Coins CSV</h3>
-                    <p className="text-[11px] text-slate-400 leading-relaxed">
-                      Complete log report containing details of the top trending assets, dynamic live price changes, ranks, and coin URLs.
-                    </p>
+                    <a
+                      href="/api/download/trending_coins.csv"
+                      className="mt-4 w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 rounded-xl font-bold text-xs flex items-center justify-center gap-2 hover:text-white transition"
+                    >
+                      <Download className="h-3.5 w-3.5 text-blue-400" /> Download CSV
+                    </a>
                   </div>
-                  <a
-                    href="/api/download/trending_coins.csv"
-                    className="mt-4 w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 rounded-xl font-bold text-xs flex items-center justify-center gap-2 hover:text-white transition"
-                  >
-                    <Download className="h-3.5 w-3.5 text-blue-400" /> Download CSV
-                  </a>
+
+                  <div className="p-5 bg-slate-950 rounded-2xl border border-slate-800 flex flex-col justify-between hover:border-slate-700 transition">
+                    <div className="space-y-2">
+                      <div className="p-2.5 bg-purple-500/10 text-purple-400 rounded-xl border border-purple-500/20 w-fit">
+                        <FileText className="h-5 w-5" />
+                      </div>
+                      <h3 className="font-bold text-white text-sm">Generated Comments CSV</h3>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Complete listing of generated AI community messages ready for automated Playwright commenting.
+                      </p>
+                    </div>
+                    <a
+                      href="/api/download/generated_comments.csv"
+                      className="mt-4 w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 rounded-xl font-bold text-xs flex items-center justify-center gap-2 hover:text-white transition"
+                    >
+                      <Download className="h-3.5 w-3.5 text-purple-400" /> Download CSV
+                    </a>
+                  </div>
+
+                  <div className="p-5 bg-slate-950 rounded-2xl border border-slate-800 flex flex-col justify-between hover:border-slate-700 transition">
+                    <div className="space-y-2">
+                      <div className="p-2.5 bg-emerald-500/10 text-emerald-400 rounded-xl border border-emerald-500/20 w-fit">
+                        <FileText className="h-5 w-5" />
+                      </div>
+                      <h3 className="font-bold text-white text-sm">Post Submissions CSV</h3>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Detailed execution outcome logs representing each individual automated browser posting session.
+                      </p>
+                    </div>
+                    <a
+                      href="/api/download/post_submissions.csv"
+                      className="mt-4 w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 rounded-xl font-bold text-xs flex items-center justify-center gap-2 hover:text-white transition"
+                    >
+                      <Download className="h-3.5 w-3.5 text-emerald-400" /> Download CSV
+                    </a>
+                  </div>
+
+                  <div className="p-5 bg-slate-950 rounded-2xl border border-slate-800 flex flex-col justify-between hover:border-slate-700 transition">
+                    <div className="space-y-2">
+                      <div className="p-2.5 bg-amber-500/10 text-amber-400 rounded-xl border border-amber-500/20 w-fit">
+                        <FileText className="h-5 w-5" />
+                      </div>
+                      <h3 className="font-bold text-white text-sm">Overall Report CSV</h3>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        High-level summary representing overall run health, conversion rates, counts, and bot execution parameters.
+                      </p>
+                    </div>
+                    <a
+                      href="/api/download/overall_report.csv"
+                      className="mt-4 w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 rounded-xl font-bold text-xs flex items-center justify-center gap-2 hover:text-white transition"
+                    >
+                      <Download className="h-3.5 w-3.5 text-amber-400" /> Download CSV
+                    </a>
+                  </div>
+
                 </div>
 
-                <div className="p-5 bg-slate-950 rounded-2xl border border-slate-800 flex flex-col justify-between hover:border-slate-700 transition">
-                  <div className="space-y-2">
-                    <div className="p-2.5 bg-amber-500/10 text-amber-400 rounded-xl border border-amber-500/20 w-fit">
-                      <FileText className="h-5 w-5" />
-                    </div>
-                    <h3 className="font-bold text-white text-sm">Duplicate URLs Report</h3>
-                    <p className="text-[11px] text-slate-400 leading-relaxed">
-                      Saves duplicates list identifying assets with identical redirect links to prevent bot from commenting on repetitive routes.
-                    </p>
-                  </div>
-                  <a
-                    href="/api/download/duplicate_urls.csv"
-                    className="mt-4 w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 rounded-xl font-bold text-xs flex items-center justify-center gap-2 hover:text-white transition"
-                  >
-                    <Download className="h-3.5 w-3.5 text-amber-400" /> Download CSV
-                  </a>
-                </div>
+                {/* 4.2. Beautiful Interactive Analytics Center */}
+                <div className="pt-6 border-t border-slate-850">
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                    
+                    {/* Success Rate Pie Chart (Radial SVG Chart) */}
+                    <div className="lg:col-span-5 bg-slate-950 p-5 rounded-2xl border border-slate-800/80 flex flex-col items-center justify-center space-y-4">
+                      <h4 className="font-bold text-white text-xs uppercase tracking-wider text-center">Submission Success Rate</h4>
+                      
+                      {results.length === 0 ? (
+                        <div className="py-12 text-center text-xs text-slate-500 italic">
+                          No submissions executed yet to compute analytics.
+                        </div>
+                      ) : (
+                        <div className="flex flex-col items-center space-y-4 w-full">
+                          <div className="relative flex items-center justify-center w-36 h-36">
+                            {/* SVG Radial Ring */}
+                            <svg className="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+                              {/* Background Circle */}
+                              <circle
+                                cx="50"
+                                cy="50"
+                                r="40"
+                                fill="transparent"
+                                stroke="#1e293b"
+                                strokeWidth="10"
+                              />
+                              {/* Success Slice */}
+                              <circle
+                                cx="50"
+                                cy="50"
+                                r="40"
+                                fill="transparent"
+                                stroke="#10b981"
+                                strokeWidth="10"
+                                strokeDasharray={2 * Math.PI * 40}
+                                strokeDashoffset={2 * Math.PI * 40 - (results.filter(r => r.status === "success").length / (results.filter(r => r.status !== "skipped").length || 1)) * (2 * Math.PI * 40)}
+                                strokeLinecap="round"
+                              />
+                            </svg>
+                            <div className="absolute flex flex-col items-center justify-center">
+                              <span className="text-2xl font-extrabold text-white">
+                                {Math.round((results.filter(r => r.status === "success").length / (results.filter(r => r.status !== "skipped").length || 1)) * 100)}%
+                              </span>
+                              <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Success</span>
+                            </div>
+                          </div>
 
-                <div className="p-5 bg-slate-950 rounded-2xl border border-slate-800 flex flex-col justify-between hover:border-slate-700 transition">
-                  <div className="space-y-2">
-                    <div className="p-2.5 bg-purple-500/10 text-purple-400 rounded-xl border border-purple-500/20 w-fit">
-                      <FileText className="h-5 w-5" />
+                          <div className="grid grid-cols-2 gap-4 w-full text-center">
+                            <div className="bg-slate-900/40 p-2.5 rounded-xl border border-slate-800/40">
+                              <div className="text-[10px] text-slate-400 font-medium">Successful</div>
+                              <div className="text-sm font-bold text-emerald-400 font-mono">
+                                {results.filter(r => r.status === "success").length} / {results.filter(r => r.status !== "skipped").length}
+                              </div>
+                            </div>
+                            <div className="bg-slate-900/40 p-2.5 rounded-xl border border-slate-800/40">
+                              <div className="text-[10px] text-slate-400 font-medium">Failed / Skipped</div>
+                              <div className="text-sm font-bold text-rose-400 font-mono">
+                                {results.filter(r => r.status !== "success" && r.status !== "skipped").length} F / {results.filter(r => r.status === "skipped").length} S
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
-                    <h3 className="font-bold text-white text-sm">Duplicate Names Report</h3>
-                    <p className="text-[11px] text-slate-400 leading-relaxed">
-                      Provides database lookup CSV reporting cryptocurrencies registered with identical corporate titles or names.
-                    </p>
-                  </div>
-                  <a
-                    href="/api/download/duplicate_names.csv"
-                    className="mt-4 w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 rounded-xl font-bold text-xs flex items-center justify-center gap-2 hover:text-white transition"
-                  >
-                    <Download className="h-3.5 w-3.5 text-purple-400" /> Download CSV
-                  </a>
-                </div>
 
-                <div className="p-5 bg-slate-950 rounded-2xl border border-slate-800 flex flex-col justify-between hover:border-slate-700 transition">
-                  <div className="space-y-2">
-                    <div className="p-2.5 bg-emerald-500/10 text-emerald-400 rounded-xl border border-emerald-500/20 w-fit">
-                      <FileText className="h-5 w-5" />
+                    {/* Overall Conversion & Sentiment Health */}
+                    <div className="lg:col-span-7 bg-slate-950 p-5 rounded-2xl border border-slate-800/80 flex flex-col justify-between">
+                      <div>
+                        <h4 className="font-bold text-white text-xs uppercase tracking-wider mb-4">Sentiment & Channel Statistics</h4>
+                        
+                        <div className="space-y-4">
+                          <div>
+                            <div className="flex justify-between items-center text-xs text-slate-400 mb-1.5">
+                              <span>Bullish Target Engagement</span>
+                              <span className="font-mono text-emerald-400 font-semibold">
+                                {messagesList.filter(m => m.sentiment !== "bearish").length} coins
+                              </span>
+                            </div>
+                            <div className="w-full bg-slate-900 h-1.5 rounded-full overflow-hidden">
+                              <div
+                                className="bg-emerald-400 h-full transition-all duration-500"
+                                style={{
+                                  width: `${messagesList.length > 0 ? (messagesList.filter(m => m.sentiment !== "bearish").length / messagesList.length) * 100 : 0}%`
+                                }}
+                              ></div>
+                            </div>
+                          </div>
+
+                          <div>
+                            <div className="flex justify-between items-center text-xs text-slate-400 mb-1.5">
+                              <span>Bearish Target Engagement</span>
+                              <span className="font-mono text-rose-400 font-semibold">
+                                {messagesList.filter(m => m.sentiment === "bearish").length} coins
+                              </span>
+                            </div>
+                            <div className="w-full bg-slate-900 h-1.5 rounded-full overflow-hidden">
+                              <div
+                                className="bg-rose-400 h-full transition-all duration-500"
+                                style={{
+                                  width: `${messagesList.length > 0 ? (messagesList.filter(m => m.sentiment === "bearish").length / messagesList.length) * 100 : 0}%`
+                                }}
+                              ></div>
+                            </div>
+                          </div>
+
+                          <div>
+                            <div className="flex justify-between items-center text-xs text-slate-400 mb-1.5">
+                              <span>Total Unique Targets Added</span>
+                              <span className="font-mono text-blue-400 font-semibold">
+                                {coinsList.length} unique assets
+                              </span>
+                            </div>
+                            <div className="w-full bg-slate-900 h-1.5 rounded-full overflow-hidden">
+                              <div className="bg-blue-400 h-full w-full"></div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="bg-slate-900/30 p-3 rounded-xl border border-slate-800/40 text-[11px] text-slate-400 mt-4 leading-relaxed">
+                        <span className="font-bold text-slate-200">System Insight:</span> Real-time sentiment categorization uses your generated OpenAI comments database. Ensure your Playwright State credentials in auth/state.json remain updated to maintain maximum success rates.
+                      </div>
                     </div>
-                    <h3 className="font-bold text-white text-sm">Duplicate Symbols Report</h3>
-                    <p className="text-[11px] text-slate-400 leading-relaxed">
-                      Flags and exports list of assets containing repeating tickers or token abbreviations for database audit logs.
-                    </p>
-                  </div>
-                  <a
-                    href="/api/download/duplicate_symbols.csv"
-                    className="mt-4 w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-800 rounded-xl font-bold text-xs flex items-center justify-center gap-2 hover:text-white transition"
-                  >
-                    <Download className="h-3.5 w-3.5 text-emerald-400" /> Download CSV
-                  </a>
-                </div>
 
+                  </div>
+                </div>
               </div>
             )}
 
@@ -1404,56 +1571,193 @@ export default function App() {
         <p className="tracking-wide">CoinMarketCap Automated Community Bot Control Panel © 2026. All rights reserved.</p>
       </footer>
 
-      {/* MODAL: PASTE COOKIE SESSION */}
+      {/* MODAL: PASTE COOKIE SESSION OR LOGIN */}
       {showSessionModal && (
-        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full overflow-hidden shadow-2xl flex flex-col justify-between animate-in fade-in zoom-in-95 duration-200">
-            <div className="p-5 space-y-4">
-              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-                <h3 className="font-bold text-white text-sm flex items-center gap-2">
-                  <Upload className="h-4 w-4 text-emerald-400" /> Configure Playwright state.json
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full overflow-hidden shadow-2xl flex flex-col justify-between animate-in fade-in zoom-in-95 duration-150">
+            
+            {/* Header */}
+            <div className="p-5 pb-3 border-b border-slate-800 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="p-1.5 bg-emerald-500/10 text-emerald-400 rounded-lg border border-emerald-500/20">
+                  <Key className="h-4 w-4" />
+                </span>
+                <h3 className="font-bold text-white text-sm">
+                  Configure Playwright Session
                 </h3>
-                <button
-                  onClick={() => setShowSessionModal(false)}
-                  className="text-slate-400 hover:text-white transition font-bold font-mono text-sm"
-                >
-                  ✕
-                </button>
               </div>
+              <button
+                onClick={() => {
+                  setShowSessionModal(false);
+                  handleResetLoginState();
+                }}
+                className="text-slate-400 hover:text-white transition font-bold font-mono text-sm"
+              >
+                ✕
+              </button>
+            </div>
 
-              {/* TABS SELECTOR */}
-              <div className="flex border-b border-slate-800 gap-1">
-                <button
-                  type="button"
-                  onClick={() => setSessionModalTab("manual")}
-                  className={`flex-1 pb-2 text-xs font-bold transition-all border-b-2 ${
-                    sessionModalTab === "manual"
-                      ? "text-emerald-400 border-emerald-500"
-                      : "text-slate-400 border-transparent hover:text-slate-200"
-                  }`}
-                >
-                  Option A: Paste state.json
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSessionModalTab("automated")}
-                  className={`flex-1 pb-2 text-xs font-bold transition-all border-b-2 ${
-                    sessionModalTab === "automated"
-                      ? "text-emerald-400 border-emerald-500"
-                      : "text-slate-400 border-transparent hover:text-slate-200"
-                  }`}
-                >
-                  Option B: Generate via Login
-                </button>
-              </div>
+            {/* Tab Selection */}
+            <div className="px-5 pt-3 flex gap-4 border-b border-slate-800 bg-slate-950/20">
+              <button
+                onClick={() => setLoginTab("credentials")}
+                className={`pb-3 text-xs font-bold transition-all relative ${
+                  loginTab === "credentials" ? "text-emerald-400 border-b-2 border-emerald-500" : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                1. Automated Login (New)
+              </button>
+              <button
+                onClick={() => setLoginTab("cookies")}
+                className={`pb-3 text-xs font-bold transition-all relative ${
+                  loginTab === "cookies" ? "text-emerald-400 border-b-2 border-emerald-500" : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                2. Paste state.json cookies
+              </button>
+            </div>
 
-              {sessionModalTab === "manual" ? (
+            {/* Modal Body */}
+            <div className="p-5 max-h-[60vh] overflow-y-auto space-y-4">
+
+              {loginTab === "credentials" && (
+                <div className="space-y-4 text-xs">
+                  <p className="text-slate-300 text-[11px] leading-relaxed">
+                    Log in directly using your CoinMarketCap credentials. Our backend Playwright browser will run the login, handle security, and capture/save the <code className="text-emerald-400 font-mono">state.json</code> automatically!
+                  </p>
+
+                  {loginStep === "idle" && (
+                    <div className="space-y-3">
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] uppercase text-slate-400 font-mono tracking-widest font-bold">Email Address</label>
+                        <input
+                          type="email"
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          placeholder="your-email@example.com"
+                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white focus:outline-none focus:border-emerald-500 placeholder-slate-700"
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] uppercase text-slate-400 font-mono tracking-widest font-bold">Password</label>
+                        <input
+                          type="password"
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          placeholder="••••••••••••"
+                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-white focus:outline-none focus:border-emerald-500 placeholder-slate-700"
+                        />
+                      </div>
+                      <button
+                        onClick={handleStartLogin}
+                        className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-xl text-xs transition cursor-pointer shadow-lg shadow-emerald-500/10 flex items-center justify-center gap-2"
+                      >
+                        Start Automated Login Process
+                      </button>
+                    </div>
+                  )}
+
+                  {loginStep === "authenticating" && (
+                    <div className="p-6 bg-slate-950 rounded-xl border border-slate-800 flex flex-col items-center justify-center text-center space-y-3.5">
+                      <RefreshCw className="h-8 w-8 text-emerald-400 animate-spin" />
+                      <div className="space-y-1">
+                        <h4 className="font-bold text-white text-xs">Playwright Session Running...</h4>
+                        <p className="text-[11px] text-slate-400 max-w-xs">{loginStatusMessage}</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {loginStep === "otp_required" && (
+                    <div className="space-y-4">
+                      <div className="p-3 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl space-y-1.5 text-[11px] leading-relaxed">
+                        <span className="font-bold text-white flex items-center gap-1">✉️ Action Required: Verification Code</span>
+                        <p>{loginStatusMessage}</p>
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] uppercase text-slate-400 font-mono tracking-widest font-bold">6-Digit Email Code (OTP)</label>
+                        <input
+                          type="text"
+                          value={otpCode}
+                          onChange={(e) => setOtpCode(e.target.value)}
+                          placeholder="e.g. 123456"
+                          maxLength={6}
+                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-center tracking-widest font-mono text-lg text-emerald-400 focus:outline-none focus:border-emerald-500 placeholder-slate-800"
+                        />
+                      </div>
+
+                      <div className="flex gap-2">
+                        <button
+                          onClick={handleCancelLogin}
+                          className="flex-1 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={handleSubmitOtp}
+                          className="flex-1 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl text-xs font-bold"
+                        >
+                          Confirm & Verify Code
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {loginStep === "success" && (
+                    <div className="p-5 bg-emerald-500/10 rounded-xl border border-emerald-500/20 text-emerald-400 flex flex-col items-center text-center space-y-3">
+                      <CheckCircle className="h-10 w-10 text-emerald-400" />
+                      <div className="space-y-1">
+                        <h4 className="font-bold text-white text-sm">Authentication Success!</h4>
+                        <p className="text-[11px] text-slate-300">{loginStatusMessage}</p>
+                      </div>
+                      <button
+                        onClick={() => {
+                          setShowSessionModal(false);
+                          handleResetLoginState();
+                        }}
+                        className="py-2 px-5 bg-emerald-500 text-slate-950 font-bold rounded-xl text-xs hover:bg-emerald-400 transition"
+                      >
+                        Finish & Close Panel
+                      </button>
+                    </div>
+                  )}
+
+                  {loginStep === "failed" && (
+                    <div className="space-y-4">
+                      <div className="p-5 bg-rose-500/10 rounded-xl border border-rose-500/20 text-rose-400 flex flex-col items-center text-center space-y-3">
+                        <AlertTriangle className="h-10 w-10 text-rose-400" />
+                        <div className="space-y-1">
+                          <h4 className="font-bold text-white text-sm">Login Attempt Failed</h4>
+                          <p className="text-[11px] text-slate-300">{loginStatusMessage}</p>
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={handleCancelLogin}
+                          className="flex-1 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={handleResetLoginState}
+                          className="flex-1 py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl text-xs font-bold"
+                        >
+                          Retry Login Process
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                </div>
+              )}
+
+              {loginTab === "cookies" && (
                 <div className="space-y-3.5 text-xs text-slate-300">
                   <p>
-                    To post successfully from our workspace, Playwright requires a valid <strong>CoinMarketCap login cookie state</strong>.
+                    Directly paste your existing CoinMarketCap <strong>login cookie storage state</strong> JSON array if you prefer not to enter your credentials.
                   </p>
                   <div className="p-3 bg-slate-950 rounded-lg border border-slate-850 space-y-1.5 text-[11px] leading-relaxed text-slate-400">
-                    <span className="font-bold text-white block">How to obtain cookies:</span>
+                    <span className="font-bold text-white block">How to obtain cookies manually:</span>
                     1. Log into your account on CoinMarketCap in Chrome.<br />
                     2. Use a browser extension like "EditThisCookie" or Playwright CLI to export cookies/storage as a JSON array.<br />
                     3. Paste the complete JSON object below.
@@ -1475,106 +1779,31 @@ export default function App() {
                     />
                   </div>
                 </div>
-              ) : (
-                <div className="space-y-4 text-xs text-slate-300">
-                  <p>
-                    Enter your CoinMarketCap credentials. The backend will automatically launch a secure headless browser, authenticate, and generate the required <code className="text-emerald-400 font-mono font-bold">state.json</code> file.
-                  </p>
-
-                  {!requiresOtp ? (
-                    <form onSubmit={handleInitiateLogin} className="space-y-3.5">
-                      <div className="space-y-1.5">
-                        <label className="text-[11px] uppercase text-slate-400 font-mono tracking-widest font-bold block">CoinMarketCap Email</label>
-                        <input
-                          type="email"
-                          required
-                          value={loginEmail}
-                          onChange={(e) => setLoginEmail(e.target.value)}
-                          placeholder="user@example.com"
-                          disabled={isLoggingIn}
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-emerald-400 focus:outline-none focus:border-emerald-500 disabled:opacity-50"
-                        />
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <label className="text-[11px] uppercase text-slate-400 font-mono tracking-widest font-bold block">Password</label>
-                        <input
-                          type="password"
-                          required
-                          value={loginPassword}
-                          onChange={(e) => setLoginPassword(e.target.value)}
-                          placeholder="••••••••••••"
-                          disabled={isLoggingIn}
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-emerald-400 focus:outline-none focus:border-emerald-500 disabled:opacity-50"
-                        />
-                      </div>
-
-                      <button
-                        type="submit"
-                        disabled={isLoggingIn}
-                        className="w-full py-2.5 bg-emerald-500 hover:bg-emerald-400 disabled:bg-emerald-500/50 text-slate-950 rounded-xl text-xs font-bold transition flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed"
-                      >
-                        {isLoggingIn ? "Logging in..." : "Start Automatic Login"}
-                      </button>
-                    </form>
-                  ) : (
-                    <form onSubmit={handleSubmitOtp} className="space-y-3.5">
-                      <div className="p-3 bg-amber-950/40 border border-amber-900/50 rounded-lg text-amber-300 space-y-1 text-[11px]">
-                        <span className="font-bold text-white block">Email Code Verification Required</span>
-                        CoinMarketCap has sent a security check/verification code to your email. Please check your email inbox and enter the 6-digit OTP code below.
-                      </div>
-
-                      <div className="space-y-1.5">
-                        <label className="text-[11px] uppercase text-slate-400 font-mono tracking-widest font-bold block">6-Digit OTP / Verification Code</label>
-                        <input
-                          type="text"
-                          required
-                          maxLength={6}
-                          pattern="[0-9]{6}"
-                          value={otpCode}
-                          onChange={(e) => setOtpCode(e.target.value)}
-                          placeholder="123456"
-                          disabled={isLoggingIn}
-                          className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-center font-mono text-lg tracking-widest text-emerald-400 focus:outline-none focus:border-emerald-500 disabled:opacity-50"
-                        />
-                      </div>
-
-                      <button
-                        type="submit"
-                        disabled={isLoggingIn}
-                        className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 disabled:bg-amber-500/50 text-slate-950 rounded-xl text-xs font-bold transition flex items-center justify-center gap-2 cursor-pointer disabled:cursor-not-allowed"
-                      >
-                        {isLoggingIn ? "Verifying..." : "Confirm & Complete Login"}
-                      </button>
-                    </form>
-                  )}
-
-                  {loginStatus && (
-                    <div className="p-3 bg-slate-950 rounded-xl border border-slate-850 text-[11px] font-mono leading-relaxed break-all text-slate-300">
-                      <span className="font-bold text-emerald-400 block mb-1">Status Log:</span>
-                      {loginStatus}
-                    </div>
-                  )}
-                </div>
               )}
+
             </div>
 
-            <div className="bg-slate-950 px-5 py-4 border-t border-slate-800 flex items-center justify-end gap-3">
-              <button
-                onClick={() => setShowSessionModal(false)}
-                className="py-2 px-4 rounded-xl text-slate-400 hover:text-white text-xs font-semibold"
-              >
-                Close
-              </button>
-              {sessionModalTab === "manual" && (
+            {/* Modal Footer (only for manual cookie tab) */}
+            {loginTab === "cookies" && (
+              <div className="bg-slate-950 px-5 py-4 border-t border-slate-800 flex items-center justify-end gap-3">
+                <button
+                  onClick={() => {
+                    setShowSessionModal(false);
+                    handleResetLoginState();
+                  }}
+                  className="py-2 px-4 rounded-xl text-slate-400 hover:text-white text-xs font-semibold"
+                >
+                  Cancel
+                </button>
                 <button
                   onClick={handleSaveSession}
                   className="py-2 px-5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-xl text-xs font-bold transition cursor-pointer"
                 >
                   Save & Load Session
                 </button>
-              )}
-            </div>
+              </div>
+            )}
+
           </div>
         </div>
       )}

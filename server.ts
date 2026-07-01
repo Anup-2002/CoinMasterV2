@@ -181,6 +181,16 @@ async function launchBrowserResilient(options: any = {}): Promise<any> {
   } catch (err) {
     const errMsg = (err as Error).message;
     if (
+      errMsg.includes("shared libraries") ||
+      errMsg.includes("cannot open shared object file") ||
+      errMsg.includes("libglib-2.0.so") ||
+      errMsg.includes("exitCode=127")
+    ) {
+      throw new Error(
+        "Playwright requires missing system shared libraries (like libglib-2.0.so.0) which are not pre-installed in the sandboxed AI Studio preview container (root/sudo access is not available to install them). However, these packages are fully configured to be installed automatically in production/Railway via our nixpacks.toml configuration!"
+      );
+    }
+    if (
       errMsg.includes("Executable doesn't exist") || 
       errMsg.includes("playwright install") || 
       errMsg.includes("Looks like Playwright was just installed or updated") ||

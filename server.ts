@@ -3,7 +3,16 @@ import fs from "fs";
 import { execSync } from "child_process";
 
 // Configure Playwright to use a consistent local cache directory inside the project folder
-process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(process.cwd(), ".cache", "ms-playwright");
+if (!process.env.PLAYWRIGHT_BROWSERS_PATH) {
+  const localCachePath = path.join(process.cwd(), ".cache", "ms-playwright");
+  const rootCachePath = "/root/.cache/ms-playwright";
+  let chosenPlaywrightPath = localCachePath;
+  if (!fs.existsSync(localCachePath) && fs.existsSync(rootCachePath)) {
+    chosenPlaywrightPath = rootCachePath;
+  }
+  process.env.PLAYWRIGHT_BROWSERS_PATH = chosenPlaywrightPath;
+}
+console.log(`[PLAYWRIGHT] Configured PLAYWRIGHT_BROWSERS_PATH to: ${process.env.PLAYWRIGHT_BROWSERS_PATH}`);
 
 import {
   getSessionStateCloud,
@@ -24,7 +33,9 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import OpenAI from "openai";
 import dotenv from "dotenv";
-import { chromium } from "playwright";
+import { createRequire } from "module";
+const customRequire = typeof require !== "undefined" ? require : createRequire(import.meta.url);
+const { chromium } = customRequire("playwright") as typeof import("playwright");
 import { GoogleGenAI, Type } from "@google/genai";
 
 dotenv.config({ override: true });

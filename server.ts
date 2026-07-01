@@ -1536,7 +1536,7 @@ function writeJsonFile<T>(filePath: string, data: T) {
 const isOpenAiConfigured = !!process.env.OPENAI_API_KEY;
 const isCmcConfigured = !!process.env.CMC_API_KEY;
 
-addLog("info", `OpenAI API Status: ${isOpenAiConfigured ? "CONFIGURED" : "NOT CONFIGURED (Falls back to rule-based template comments)"}`);
+addLog("info", `OpenAI API Status: ${isOpenAiConfigured ? "CONFIGURED" : "NOT CONFIGURED (Falls back to static rule-based comments)"}`);
 addLog("info", `CoinMarketCap API Status: ${isCmcConfigured ? "CONFIGURED" : "NOT CONFIGURED (Falls back to live free public crypto markets API)"}`);
 
 // ============================================================================
@@ -2371,7 +2371,7 @@ async function executeGenerateMessages(): Promise<number> {
   }
 
   if (generatedMessages.length === 0) {
-    addLog("warning", "AI generation was not completed or failed. Falling back to robust rule-based template generation...");
+    addLog("warning", "AI generation was not completed or failed. Falling back to robust rule-based comments...");
     
     const templates = {
       bullish: [
@@ -2838,7 +2838,7 @@ app.post("/api/full-flow", async (req, res) => {
     await executeFetchTrending();
 
     // Step 2: Generate
-    addLog("info", "[FLOW STEP 2/3] Generating custom AI community comments...");
+    addLog("info", "[FLOW STEP 2/3] Generating custom community comments...");
     botStatus = "Generating";
     isGeneratingRunning = true;
     try {
@@ -2938,7 +2938,7 @@ app.get("/api/download/overall_report.csv", (req, res) => {
 
   let csv = "Metric,Value,Description\n";
   csv += `"Total Trending Coins",${coins.length},"Total coins fetched from market"\n`;
-  csv += `"Generated Comments Count",${messages.length},"AI comments prepared for submission"\n`;
+  csv += `"Generated Comments Count",${messages.length},"Custom comments prepared for submission"\n`;
   csv += `"Total Submissions Executed",${results.length},"Posts attempted"\n`;
   csv += `"Successful Posts",${successCount},"Successfully posted comments"\n`;
   csv += `"Failed/Skipped Posts",${failedCount},"Posts that failed or were manually skipped"\n`;

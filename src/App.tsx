@@ -543,7 +543,7 @@ export default function App() {
               </span>
             ) : (
               <span className="text-amber-400 font-bold flex items-center gap-1">
-                <AlertTriangle className="h-3 w-3" /> Template Mode
+                <AlertTriangle className="h-3 w-3" /> Rule-Based Mode
               </span>
             )}
           </div>
@@ -1599,7 +1599,7 @@ export default function App() {
                       </div>
                       <h3 className="font-bold text-white text-sm">Generated Comments CSV</h3>
                       <p className="text-[11px] text-slate-400 leading-relaxed">
-                        Complete listing of generated AI community messages ready for automated Playwright commenting.
+                        Complete listing of generated custom comments ready for automated Playwright commenting.
                       </p>
                     </div>
                     <a

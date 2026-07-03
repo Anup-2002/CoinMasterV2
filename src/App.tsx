@@ -82,6 +82,11 @@ export default function App() {
   const [currentCoin, setCurrentCoin] = useState<string>("N/A");
   const [sessionStatus, setSessionStatus] = useState<string>("Not Checked");
   const [apiStatus, setApiStatus] = useState({ openai: false, cmc: false });
+  const [isContinuousLoopActive, setIsContinuousLoopActive] = useState<boolean>(false);
+  const [nextCycleStartTime, setNextCycleStartTime] = useState<number | null>(null);
+  const [timeLeft, setTimeLeft] = useState<number | null>(null);
+  const [continuousInterval, setContinuousInterval] = useState<number>(20);
+  const isInitialIntervalLoaded = useRef<boolean>(false);
 
   // Browser Session Upload State
   const [sessionJson, setSessionJson] = useState<string>("");
@@ -259,6 +264,72 @@ export default function App() {
         setCurrentCoin(data.currentCoin);
         setSessionStatus(data.sessionStatus);
         setApiStatus(data.apiStatus || { openai: false, cmc: false });
+        setIsContinuousLoopActive(!!data.isContinuousLoopActive);
+        setNextCycleStartTime(data.nextCycleStartTime);
+        if (data.continuousLoopIntervalMinutes !== undefined && !isInitialIntervalLoaded.current) {
+          setContinuousInterval(data.continuousLoopIntervalMinutes);
+          isInitialIntervalLoaded.current = true;
+        }
+      }
+    } catch (_) {}
+  };
+
+  // Customizable interval countdown logic
+  useEffect(() => {
+    if (!nextCycleStartTime) {
+      setTimeLeft(null);
+      return;
+    }
+
+    const updateTimer = () => {
+      const now = Date.now();
+      const diff = Math.max(0, Math.floor((nextCycleStartTime - now) / 1000));
+      setTimeLeft(diff);
+    };
+
+    updateTimer();
+    const interval = setInterval(updateTimer, 1000);
+    return () => clearInterval(interval);
+  }, [nextCycleStartTime]);
+
+  const formatTimeLeft = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}m ${secs}s`;
+  };
+
+  const toggleContinuousLoop = async (active: boolean, intervalMins?: number) => {
+    const targetMins = intervalMins !== undefined ? intervalMins : continuousInterval;
+    try {
+      const res = await fetch(resolveUrl("/api/set-continuous-loop"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ active, intervalMinutes: targetMins }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setIsContinuousLoopActive(!!data.isContinuousLoopActive);
+        setNextCycleStartTime(data.nextCycleStartTime);
+        if (data.continuousLoopIntervalMinutes !== undefined) {
+          setContinuousInterval(data.continuousLoopIntervalMinutes);
+        }
+      }
+    } catch (_) {}
+  };
+
+  const saveIntervalToServer = async (mins: number) => {
+    try {
+      const res = await fetch(resolveUrl("/api/set-continuous-loop"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ intervalMinutes: mins }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.continuousLoopIntervalMinutes !== undefined) {
+          setContinuousInterval(data.continuousLoopIntervalMinutes);
+        }
+        setNextCycleStartTime(data.nextCycleStartTime);
       }
     } catch (_) {}
   };
@@ -332,10 +403,15 @@ export default function App() {
   }, [logsList, autoScroll]);
 
   // Execute Endpoint Commands
-  const runCommand = async (endpoint: string, pendingKey: keyof typeof isPending) => {
+  const runCommand = async (endpoint: string, pendingKey: keyof typeof isPending, bodyData?: any) => {
     setIsPending(prev => ({ ...prev, [pendingKey]: true }));
     try {
-      const res = await fetch(resolveUrl(endpoint), { method: "POST" });
+      const options: RequestInit = { method: "POST" };
+      if (bodyData !== undefined) {
+        options.headers = { "Content-Type": "application/json" };
+        options.body = JSON.stringify(bodyData);
+      }
+      const res = await fetch(resolveUrl(endpoint), options);
       const data = await res.json();
       fetchStats();
       fetchLogs();
@@ -875,7 +951,7 @@ export default function App() {
             {/* FULL AUTOMATION SEQUENCE BUTTON */}
             <div className="mt-6 pt-5 border-t border-slate-800 flex flex-col gap-3">
               <button
-                onClick={() => runCommand("/api/full-flow", "full")}
+                onClick={() => runCommand("/api/full-flow", "full", { continuous: isContinuousLoopActive, intervalMinutes: continuousInterval })}
                 disabled={isPending.full || isBusy}
                 className="w-full p-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 transition flex items-center justify-center gap-2 font-extrabold text-sm shadow-lg shadow-emerald-500/10 disabled:opacity-50 cursor-pointer"
                 id="btn-full-flow"
@@ -887,6 +963,7 @@ export default function App() {
                 )}
                 Run Full Automated Bot Cycle
               </button>
+              
               <div className="flex items-center justify-between text-[11px] text-slate-500">
                 <span>Runs fetch, generate & post in a row</span>
                 <button
@@ -897,6 +974,80 @@ export default function App() {
                 >
                   <Trash2 className="h-3 w-3" /> Reset Storage
                 </button>
+              </div>
+
+              {/* CONTINUOUS LOOP CONTROL SWITCH WITH CONFIGURABLE TIMER */}
+              <div className="mt-2 flex flex-col gap-2">
+                <div className="bg-slate-950/45 p-3 rounded-xl border border-slate-800 flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex flex-col">
+                      <span className="text-[11px] font-bold text-slate-200">Continuous Automation Loop</span>
+                      <span className="text-[9px] text-slate-500">Auto-restarts cycle after selected gap</span>
+                    </div>
+                    <label className="relative inline-flex items-center cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={isContinuousLoopActive}
+                        onChange={(e) => toggleContinuousLoop(e.target.checked, continuousInterval)}
+                        className="sr-only peer"
+                        id="chk-continuous"
+                      />
+                      <div className="w-8 h-4.5 bg-slate-800 rounded-full peer peer-focus:outline-none peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-slate-400 after:border-slate-300 after:border after:rounded-full after:h-3.5 after:w-3.5 after:transition-all peer-checked:bg-emerald-500 peer-checked:after:bg-slate-950 peer-checked:after:border-transparent"></div>
+                    </label>
+                  </div>
+
+                  <div className="flex flex-col gap-1.5 pt-2 border-t border-slate-800/60">
+                    <div className="flex justify-between items-center text-[10px]">
+                      <span className="text-slate-400 font-medium">Cooldown Interval:</span>
+                      <span className="text-emerald-400 font-mono font-bold">{continuousInterval} minutes</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range"
+                        min="1"
+                        max="120"
+                        value={continuousInterval}
+                        onChange={(e) => {
+                          const val = Number(e.target.value);
+                          setContinuousInterval(val);
+                        }}
+                        onMouseUp={() => {
+                          saveIntervalToServer(continuousInterval);
+                        }}
+                        onTouchEnd={() => {
+                          saveIntervalToServer(continuousInterval);
+                        }}
+                        className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                        id="slider-interval"
+                      />
+                      <input
+                        type="number"
+                        min="1"
+                        max="1440"
+                        value={continuousInterval}
+                        onChange={(e) => {
+                          const val = Math.max(1, Number(e.target.value));
+                          setContinuousInterval(val);
+                          saveIntervalToServer(val);
+                        }}
+                        className="w-14 bg-slate-900 border border-slate-800 rounded px-1.5 py-0.5 text-center text-[10px] font-mono text-emerald-400 focus:outline-none focus:border-emerald-500/50"
+                        id="num-interval"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {isContinuousLoopActive && nextCycleStartTime && timeLeft !== null && (
+                  <div className="bg-emerald-500/5 border border-emerald-500/10 rounded-xl p-3 flex items-center justify-between animate-pulse">
+                    <div className="flex items-center gap-1.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500"></span>
+                      <span className="text-[10px] text-emerald-400 font-semibold">Sleeping / Cooldown</span>
+                    </div>
+                    <span className="font-mono text-[10px] text-slate-400">
+                      Next Run in: <strong className="text-emerald-400 font-bold">{formatTimeLeft(timeLeft)}</strong>
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
           </section>

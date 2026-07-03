@@ -293,6 +293,77 @@ let isPostingRunning = false;
 let isGeneratingRunning = false;
 let runMode = "Real Browser"; // "Real Browser" (Simulation mode disabled)
 
+let isContinuousLoopActive = false;
+let nextCycleStartTime: number | null = null;
+let nextCycleTimeout: NodeJS.Timeout | null = null;
+let continuousLoopIntervalMinutes = 20; // Customizable, default 20 minutes
+
+function cancelNextAutomationCycle() {
+  isContinuousLoopActive = false;
+  nextCycleStartTime = null;
+  if (nextCycleTimeout) {
+    clearTimeout(nextCycleTimeout);
+    nextCycleTimeout = null;
+    addLog("info", "Scheduled continuous bot cycle has been cancelled.");
+  }
+}
+
+function scheduleNextAutomationCycle() {
+  if (nextCycleTimeout) {
+    clearTimeout(nextCycleTimeout);
+  }
+  
+  const gapMs = continuousLoopIntervalMinutes * 60 * 1000;
+  nextCycleStartTime = Date.now() + gapMs;
+  addLog("info", `Next automated bot cycle is scheduled to start in ${continuousLoopIntervalMinutes} minutes (at ${new Date(nextCycleStartTime).toLocaleTimeString()}).`);
+  
+  nextCycleTimeout = setTimeout(async () => {
+    nextCycleTimeout = null;
+    nextCycleStartTime = null;
+    if (isContinuousLoopActive) {
+      addLog("info", "========================================");
+      addLog("info", "Triggering scheduled continuous loop cycle...");
+      addLog("info", "========================================");
+      
+      // Clear previous results and progress for the new run
+      writeJsonFile(RESULTS_FILE, []);
+      writeJsonFile(POST_PROGRESS_FILE, { next_index: 0 });
+      
+      try {
+        // Step 1: Fetch
+        addLog("info", "[FLOW STEP 1/3] Fetching latest trending coins...");
+        botStatus = "Fetching";
+        await executeFetchTrending();
+
+        // Step 2: Generate
+        addLog("info", "[FLOW STEP 2/3] Generating custom community comments...");
+        botStatus = "Generating";
+        isGeneratingRunning = true;
+        try {
+          await executeGenerateMessages();
+        } finally {
+          isGeneratingRunning = false;
+        }
+
+        // Step 3: Post
+        addLog("info", "[FLOW STEP 3/3] Launching automated comment submitter...");
+        isPostingRunning = true;
+        botStatus = "Posting";
+        currentPostingIndex = 0;
+        runPostingLoop();
+      } catch (error) {
+        addLog("error", `Scheduled full cycle failed: ${(error as Error).message}`);
+        botStatus = "Idle";
+        isPostingRunning = false;
+        // Schedule next one anyway if continuous loop is still active
+        if (isContinuousLoopActive) {
+          scheduleNextAutomationCycle();
+        }
+      }
+    }
+  }, gapMs);
+}
+
 interface LoginSession {
   browser: any;
   context: any;
@@ -1643,7 +1714,10 @@ app.get("/api/status", (req, res) => {
     apiStatus: {
       openai: isOpenAiConfigured,
       cmc: isCmcConfigured,
-    }
+    },
+    isContinuousLoopActive,
+    nextCycleStartTime,
+    continuousLoopIntervalMinutes,
   });
 });
 
@@ -1657,6 +1731,34 @@ app.post("/api/set-run-mode", (req, res) => {
     addLog("warning", `Invalid run mode requested: ${mode}. Keeping current: ${runMode}`);
   }
   res.json({ success: true, runMode });
+});
+
+// 4.55. Set continuous loop active
+app.post("/api/set-continuous-loop", (req, res) => {
+  const { active, intervalMinutes } = req.body;
+  if (intervalMinutes !== undefined && typeof intervalMinutes === "number" && intervalMinutes > 0) {
+    continuousLoopIntervalMinutes = intervalMinutes;
+    addLog("info", `Continuous Loop interval updated to ${continuousLoopIntervalMinutes} minutes.`);
+  }
+  if (active !== undefined) {
+    const nextActive = !!active;
+    if (nextActive !== isContinuousLoopActive) {
+      isContinuousLoopActive = nextActive;
+      if (isContinuousLoopActive) {
+        addLog("success", `Continuous Automation Loop enabled (${continuousLoopIntervalMinutes}-minute interval).`);
+        if (botStatus === "Completed" || botStatus === "Idle") {
+          scheduleNextAutomationCycle();
+        }
+      } else {
+        cancelNextAutomationCycle();
+        addLog("warning", "Continuous Automation Loop disabled.");
+      }
+    } else if (isContinuousLoopActive && intervalMinutes !== undefined) {
+      addLog("info", `Rescheduling next cycle due to interval change to ${continuousLoopIntervalMinutes} minutes.`);
+      scheduleNextAutomationCycle();
+    }
+  }
+  res.json({ success: true, isContinuousLoopActive, nextCycleStartTime, continuousLoopIntervalMinutes });
 });
 
 // 4.6. Check system dependencies & Playwright health
@@ -2747,6 +2849,10 @@ async function runPostingLoop() {
           addLog("error", "CRITICAL: Automated posting paused due to 3 consecutive failures. Please verify your CoinMarketCap login session and cookies.");
           isPostingRunning = false;
           botStatus = "Idle";
+          if (isContinuousLoopActive) {
+            cancelNextAutomationCycle();
+            addLog("error", "[AUTOMATION] Continuous automation loop disabled due to 3 consecutive authentication failures.");
+          }
           break;
         }
         if (!retrySuccess) {
@@ -2775,6 +2881,10 @@ async function runPostingLoop() {
           addLog("error", "CRITICAL: Automated posting paused due to 3 consecutive failures. Please verify your CoinMarketCap login session and cookies.");
           isPostingRunning = false;
           botStatus = "Idle";
+          if (isContinuousLoopActive) {
+            cancelNextAutomationCycle();
+            addLog("error", "[AUTOMATION] Continuous automation loop disabled due to 3 consecutive authentication failures.");
+          }
           break;
         }
         addLog("info", "Skipping to next coin to maintain end-to-end automation run...");
@@ -2790,6 +2900,10 @@ async function runPostingLoop() {
       addLog("success", "CONGRATULATIONS: Complete automated posting run finished successfully!");
       botStatus = "Completed";
       isPostingRunning = false;
+      if (isContinuousLoopActive) {
+        addLog("info", `[AUTOMATION] Continuous automation mode is enabled. Triggering ${continuousLoopIntervalMinutes}-minute gap interval...`);
+        scheduleNextAutomationCycle();
+      }
     } else if (!isPostingRunning) {
       botStatus = "Idle";
     }
@@ -2806,8 +2920,9 @@ async function runPostingLoop() {
 app.post("/api/stop-posting", (req, res) => {
   isPostingRunning = false;
   botStatus = "Idle";
-  addLog("warning", "Automated posting sequence has been manually stopped/paused.");
-  res.json({ success: true, message: "Posting sequence stopped." });
+  cancelNextAutomationCycle();
+  addLog("warning", "Automated posting sequence has been manually stopped/paused and scheduled cycles are cancelled.");
+  res.json({ success: true, message: "Posting sequence stopped and scheduled cycles cancelled." });
 });
 
 // 10. Full flow execution
@@ -2823,6 +2938,16 @@ app.post("/api/full-flow", async (req, res) => {
   try {
     const prevMessages = readJsonFile<GeneratedMessage[]>(GENERATED_MESSAGES_FILE, []);
     const prevProgress = readJsonFile<{ next_index: number }>(POST_PROGRESS_FILE, { next_index: 0 });
+
+    const reqContinuous = req.body.continuous !== undefined ? !!req.body.continuous : true;
+    isContinuousLoopActive = reqContinuous;
+    const reqInterval = req.body.intervalMinutes !== undefined ? Number(req.body.intervalMinutes) : continuousLoopIntervalMinutes;
+    if (reqInterval > 0) {
+      continuousLoopIntervalMinutes = reqInterval;
+    }
+    if (isContinuousLoopActive) {
+      addLog("info", `[AUTOMATION] Continuous Loop Mode has been ENABLED for this execution sequence (${continuousLoopIntervalMinutes}-minute gap).`);
+    }
 
     if (prevMessages.length > 0 && prevProgress.next_index < prevMessages.length) {
       addLog("info", `[FLOW RESUME] A posting run is already in progress (${prevProgress.next_index}/${prevMessages.length} posted). Skipping storage reset.`);
@@ -2876,6 +3001,7 @@ app.post("/api/full-flow", async (req, res) => {
     botStatus = "Idle";
     isPostingRunning = false;
     isGeneratingRunning = false;
+    isContinuousLoopActive = false;
     res.status(500).json({ error: (error as Error).message });
   }
 });

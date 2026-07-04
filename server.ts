@@ -2890,9 +2890,9 @@ async function runPostingLoop() {
         addLog("info", "Skipping to next coin to maintain end-to-end automation run...");
       }
 
-      // Interval spacing between posts to avoid bot detection (1.5 - 3 seconds)
-      const spacing = 1500 + Math.random() * 1500;
-      addLog("info", `Cooling down for ${(spacing / 1000).toFixed(1)} seconds before proceeding...`);
+      // Interval spacing between posts to target 2-3 coins per minute (approx 18-22 seconds delay)
+      const spacing = 18000 + Math.random() * 4000;
+      addLog("info", `Cooling down for ${(spacing / 1000).toFixed(1)} seconds to maintain a posting rate of 2-3 coins per minute...`);
       await new Promise(resolve => setTimeout(resolve, spacing));
     }
 
